@@ -1,0 +1,95 @@
+"""Central configuration: limits, context budget, LLM provider presets, price table, paths."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass(frozen=True)
+class Limits:
+    max_llm_turns: int = 12          # per user message / proactive run
+    max_tool_calls: int = 25
+    max_wall_seconds: float = 90.0
+    max_tool_retries: int = 3
+    status_poll_backoff_s: tuple[float, ...] = (1.0, 3.0, 6.0)
+    llm_timeout_s: float = 30.0
+    llm_retries: int = 2
+
+
+@dataclass(frozen=True)
+class ContextConfig:
+    budget_tokens: int = 6000
+    max_memories: int = 8
+    chars_per_token: float = 3.5     # deterministic offline estimate
+
+
+@dataclass(frozen=True)
+class ProviderPreset:
+    base_url: str
+    model: str
+    key_env: str | None
+
+
+PROVIDER_PRESETS: dict[str, ProviderPreset] = {
+    # Groq alternative: LLM_MODEL=qwen/qwen3.8-27b
+    "groq": ProviderPreset("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", "GROQ_API_KEY"),
+    # 4b, not 8b: dev machine is an M1 with 8 GB RAM
+    "ollama": ProviderPreset("http://localhost:11434/v1", "qwen3:4b", None),
+    "openrouter": ProviderPreset("https://openrouter.ai/api/v1", "", "OPENROUTER_API_KEY"),
+}
+
+# Estimated list prices, USD per 1M tokens (input, output). Estimates only; verify before quoting.
+# Models missing from the table are traced with cost=null.
+PRICES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    "openai/gpt-oss-120b": (0.15, 0.75),
+    "qwen3:4b": (0.0, 0.0),
+}
+USD_TO_INR = 84.0
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    provider: str
+    base_url: str
+    model: str
+    api_key: str | None
+    fallback: str | None
+
+
+def llm_settings(provider: str | None = None) -> LLMSettings:
+    provider = provider or os.getenv("LLM_PROVIDER", "groq")
+    preset = PROVIDER_PRESETS[provider]
+    api_key = os.getenv("LLM_API_KEY") or (os.getenv(preset.key_env) if preset.key_env else None)
+    return LLMSettings(
+        provider=provider,
+        base_url=os.getenv("LLM_BASE_URL") or preset.base_url,
+        model=os.getenv("LLM_MODEL") or preset.model,
+        api_key=api_key or ("ollama" if provider == "ollama" else None),
+        fallback=os.getenv("LLM_FALLBACK", "ollama") or None,
+    )
+
+
+@dataclass(frozen=True)
+class Paths:
+    agent_db: Path = ROOT / "agent.db"
+    mock_db: Path = ROOT / "mock.db"
+    traces: Path = ROOT / "traces"
+    cassettes: Path = ROOT / "cassettes"
+    evals: Path = ROOT / "evals"
+
+
+@dataclass(frozen=True)
+class Settings:
+    limits: Limits = field(default_factory=Limits)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    paths: Paths = field(default_factory=Paths)
+    hold_ttl_s: int = 600
+    approval_ttl_s: int = 600
+    user_id: str = "u1"

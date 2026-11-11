@@ -1,0 +1,20 @@
+# secrets
+.env
+
+# databases (agent.db, mock.db, test temp dbs)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# traces: keep only the committed demo trace
+traces/*
+!traces/.gitkeep
+!traces/timeout_after_success.jsonl
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
