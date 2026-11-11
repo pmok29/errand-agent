@@ -138,7 +138,7 @@ def test_reschedule_conflict_then_new_slot_uses_new_key(world_factory):
     out = w.executor.run(second)
     assert out.kind == "rescheduled" and second.attempt_no == 2 and second.idem_key != first.idem_key
     assert not any(c["key"] == second.idem_key and c["action"] != "reschedule" for c in w.mock.idem_keys())
-    assert next(b for b in w.mock.ledger() if b["booking_id"] == "b-ac-wed")["slot"] == "2026-11-14T15:00"
+    assert w.booking("b-ac-wed")["slot"] == "2026-11-14T15:00"
 
 
 # ---------- restart recovery ----------

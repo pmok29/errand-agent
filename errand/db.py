@@ -65,6 +65,12 @@ CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload_json TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_errands_session ON errands (session_id, state);
+CREATE INDEX IF NOT EXISTS ix_holds_errand ON holds (errand_id);
+CREATE INDEX IF NOT EXISTS ix_approvals_errand ON approvals (errand_id, code);
+CREATE INDEX IF NOT EXISTS ix_executions_errand ON executions (errand_id, action, state);
+CREATE INDEX IF NOT EXISTS ix_executions_state ON executions (state);
+CREATE INDEX IF NOT EXISTS ix_notifications_session ON notifications (session_id, delivered);
 """
 
 
@@ -73,16 +79,25 @@ def new_id(prefix: str) -> str:
 
 
 class DB:
-    def __init__(self, path: Path | str):
+    """Autocommit sqlite connection with WAL, a schema, and a (re-entrant) transaction helper."""
+
+    def __init__(self, path: Path | str, schema: str = SCHEMA):
         self.path = str(path)
         self.conn = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.executescript(SCHEMA)
+        self.conn.executescript(schema)
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        """Explicit transaction; commits on success, rolls back on any exception."""
+        """Explicit transaction; commits on success, rolls back on any exception.
+
+        Nested use joins the outer transaction, so helpers can be atomic on their own and still
+        compose inside a larger unit of work.
+        """
+        if self.conn.in_transaction:
+            yield self.conn
+            return
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield self.conn

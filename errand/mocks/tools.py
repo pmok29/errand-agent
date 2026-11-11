@@ -1,24 +1,11 @@
-"""The eight fixed-contract tools: names, argument validation, and dispatch to the mock service."""
+"""Argument validation and dispatch of the fixed-contract tools to the mock service."""
 from __future__ import annotations
 
 from typing import Any
 
+from errand.contract import CONTRACT, OPTIONAL
 from errand.mocks.service import MockProviderService
 from errand.models import ToolResult
-
-# name -> required argument names (get_booking_status takes exactly one of its two)
-CONTRACT: dict[str, tuple[str, ...]] = {
-    "search_providers": ("service", "area", "date_range"),
-    "get_provider": ("provider_id",),
-    "hold_slot": ("provider_id", "slot"),
-    "book": ("hold_id", "idempotency_key"),
-    "get_booking_status": (),
-    "cancel": ("booking_id", "idempotency_key"),
-    "reschedule": ("booking_id", "slot", "idempotency_key"),
-    "list_bookings": ("user_id",),
-}
-OPTIONAL: dict[str, tuple[str, ...]] = {"get_booking_status": ("hold_id", "idempotency_key")}
-SIDE_EFFECT_TOOLS = frozenset({"book", "cancel", "reschedule"})
 
 
 def call(service: MockProviderService, name: str, args: dict[str, Any]) -> ToolResult:

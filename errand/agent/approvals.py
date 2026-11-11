@@ -6,17 +6,17 @@ which is built only from persisted records (hold quote, seen booking), never fro
 from __future__ import annotations
 
 import base64
-import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from errand.agent.keys import canonical, idem_key, payload_hash
+from errand.agent.keys import payload_hash
 from errand.agent.state import transition
-from errand.agent.store import Store
+from errand.agent.store import Store, slot_ref
+from errand.clock import is_expired
 from errand.db import new_id
 from errand.models import (Action, Approval, ApprovalDraft, ApprovalStatus, Errand, ErrandKind,
-                           ErrandState, Execution, ExecState)
+                           ErrandState, Execution, Hold)
 from errand.tracing.tracer import Tracer
 
 CODE_RE = re.compile(r"\s*confirm\s+([a-z2-7]{4})\s*[.!]?\s*", re.I)
@@ -30,6 +30,18 @@ def action_for(kind: ErrandKind) -> Action:
     return Action.BOOK if kind in (ErrandKind.BOOK, ErrandKind.REBOOK) else Action(kind)
 
 
+def fmt_slot(slot: str) -> str:
+    return datetime.fromisoformat(slot).strftime("%a %d %b, %H:%M")
+
+
+def fmt_money(v: int | None) -> str:
+    return f"₹{v:,}" if v is not None else ""
+
+
+def book_payload(hold: Hold) -> dict:
+    return {"hold_id": hold.hold_id, "slot": hold.slot, "price": hold.quoted_price}
+
+
 def build_draft(store: Store, errand: Errand, action: Action, slot: str | None = None,
                 booking_id: str | None = None) -> ApprovalDraft:
     if action != action_for(errand.kind):
@@ -38,7 +50,7 @@ def build_draft(store: Store, errand: Errand, action: Action, slot: str | None =
         hold = store.latest_hold(errand.id)
         if hold is None:
             raise DraftError("hold a slot before requesting approval")
-        if datetime.fromisoformat(hold.expires_at) <= store.clock.now():
+        if is_expired(hold.expires_at, store.clock.now()):
             raise DraftError("the hold has expired; hold the slot again")
         prov = store.ref(errand.id, "provider", hold.provider_id) or {}
         return ApprovalDraft(action=action, provider_id=hold.provider_id,
@@ -51,28 +63,23 @@ def build_draft(store: Store, errand: Errand, action: Action, slot: str | None =
     if action == Action.CANCEL:
         return ApprovalDraft(action=action, provider_id=b["provider_id"], provider_name=b["provider_name"],
                              slot=b["slot"], price=b.get("price"), booking_id=booking_id)
-    if slot is None or store.ref(errand.id, "slot", f"{b['provider_id']}|{slot}") is None:
+    if slot is None or store.ref(errand.id, "slot", slot_ref(b["provider_id"], slot)) is None:
         raise DraftError("pick a slot that this provider actually offered")
     return ApprovalDraft(action=action, provider_id=b["provider_id"], provider_name=b["provider_name"],
                          slot=slot, old_slot=b["slot"], price=b.get("price"), booking_id=booking_id)
 
 
 def draft_hash(draft: ApprovalDraft) -> str:
-    return hashlib.sha256(canonical(draft.model_dump(mode="json")).encode()).hexdigest()[:32]
+    return payload_hash(draft.model_dump(mode="json"))
 
 
 def code_for(hash: str) -> str:
     return base64.b32encode(bytes.fromhex(hash))[:4].decode()
 
 
-def fmt_slot(slot: str) -> str:
-    return datetime.fromisoformat(slot).strftime("%a %d %b, %H:%M")
-
-
 def render_card(draft: ApprovalDraft, code: str) -> dict:
-    price = f"₹{draft.price:,}" if draft.price is not None else None
     if draft.action == Action.BOOK:
-        line = f"Book {draft.provider_name} on {fmt_slot(draft.slot)} for {price}"
+        line = f"Book {draft.provider_name} on {fmt_slot(draft.slot)} for {fmt_money(draft.price)}"
     elif draft.action == Action.CANCEL:
         line = f"Cancel your {draft.provider_name} booking on {fmt_slot(draft.slot)}"
     else:
@@ -84,8 +91,7 @@ def render_card(draft: ApprovalDraft, code: str) -> dict:
 
 def payload_for(store: Store, errand: Errand, draft: ApprovalDraft) -> dict:
     if draft.action == Action.BOOK:
-        hold = store.latest_hold(errand.id)
-        return {"hold_id": hold.hold_id, "slot": hold.slot, "price": hold.quoted_price}
+        return book_payload(store.latest_hold(errand.id))
     if draft.action == Action.CANCEL:
         return {"booking_id": draft.booking_id}
     return {"booking_id": draft.booking_id, "slot": draft.slot}
@@ -126,13 +132,12 @@ class ConsumeResult:
 def consume(store: Store, tracer: Tracer, errand: Errand, code: str) -> ConsumeResult:
     """Atomically: approval -> consumed, write-ahead execution row inserted, errand -> EXECUTING."""
     with store.db.tx():
-        matches = [a for a in store.approvals_for(errand.id) if a.code == code]
-        if not matches:
+        a = store.approval_by_code(errand.id, code)
+        if a is None:
             return ConsumeResult("no_match")
-        a = matches[-1]
         if a.status != ApprovalStatus.PENDING:
             return ConsumeResult("already_consumed" if a.status == ApprovalStatus.CONSUMED else str(a.status), approval=a)
-        if datetime.fromisoformat(a.expires_at) <= store.clock.now():
+        if is_expired(a.expires_at, store.clock.now()):
             store.set_approval_status(a.id, ApprovalStatus.EXPIRED)
             tracer.emit("approval_expired", errand_id=errand.id, approval_id=a.id)
             return ConsumeResult("expired", approval=a)
@@ -145,13 +150,8 @@ def consume(store: Store, tracer: Tracer, errand: Errand, code: str) -> ConsumeR
             tracer.emit("approval_invalidated", errand_id=errand.id, approval_id=a.id, reason="material_change")
             return ConsumeResult("changed", approval=a)
         store.set_approval_status(a.id, ApprovalStatus.CONSUMED)
-        attempt = store.next_attempt_no(errand.id, a.draft.action)
-        payload = payload_for(store, errand, a.draft)
-        exe = Execution(id=new_id("x"), errand_id=errand.id, action=a.draft.action, attempt_no=attempt,
-                        idem_key=idem_key(errand.id, a.draft.action, attempt), payload_hash=payload_hash(payload),
-                        approval_hash=a.hash, payload=payload, state=ExecState.EXECUTING)
-        store.insert_execution(exe)
+        exe = store.open_execution(errand.id, a.draft.action, payload_for(store, errand, a.draft), a.hash)
         transition(store, tracer, errand, ErrandState.EXECUTING, "approval_consumed")
     tracer.emit("approval_consumed", errand_id=errand.id, approval_id=a.id, execution_id=exe.id,
-                idem_key=exe.idem_key, attempt_no=attempt)
+                idem_key=exe.idem_key, attempt_no=exe.attempt_no)
     return ConsumeResult("ok", execution=exe, approval=a)

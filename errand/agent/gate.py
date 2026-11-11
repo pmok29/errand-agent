@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from errand.agent.approvals import action_for
+from errand.agent.keys import side_effect_args
 from errand.agent.state import TOOLS_BY_STATE
-from errand.agent.store import GUARD_STATES, Store
+from errand.agent.store import Store, slot_ref
 from errand.config import Limits
-from errand.mocks.tools import SIDE_EFFECT_TOOLS
-from errand.models import Action, ApprovalStatus, Errand, ErrandKind, Execution, ExecState
+from errand.contract import SIDE_EFFECT_TOOLS
+from errand.models import Action, ApprovalStatus, Errand, Execution, ExecState, split_date_range
 from errand.tracing.tracer import Tracer
 
 
@@ -19,16 +20,15 @@ class Decision:
     reason: str = "ok"
 
 
-def _norm_range(value: Any) -> tuple[str, str] | None:
-    if isinstance(value, dict):
-        value = (value.get("start"), value.get("end"))
-    if isinstance(value, str):
-        value = value.split("..")
-    try:
-        start, end = value
-        return str(start), str(end)
-    except (TypeError, ValueError):
-        return None
+# IDs a tool's arguments must reference: (ref kind, how to build the ref from args, denial message)
+REQUIRED_REFS: dict[str, tuple[tuple[str, Callable[[dict], str], str], ...]] = {
+    "get_provider": (("provider", lambda a: a.get("provider_id", ""),
+                      "unknown provider_id; use one returned by search_providers"),),
+    "hold_slot": (("provider", lambda a: a.get("provider_id", ""),
+                   "unknown provider_id; use one returned by search_providers"),
+                  ("slot", lambda a: slot_ref(a.get("provider_id", ""), a.get("slot", "")),
+                   "that slot was not offered by this provider")),
+}
 
 
 class Gate:
@@ -50,31 +50,27 @@ class Gate:
                                    "call request_approval instead")
         if tool not in TOOLS_BY_STATE[e.state]:
             return Decision(False, f"{tool} is not available in state {e.state}")
-        ref = lambda kind, r: self.store.ref(e.id, kind, r) is not None  # noqa: E731
+        if tool == "hold_slot" and action_for(e.kind) != Action.BOOK:
+            return Decision(False, f"hold_slot is not used for a {e.kind}")
+        for kind, make_ref, message in REQUIRED_REFS.get(tool, ()):
+            if self.store.ref(e.id, kind, make_ref(args)) is None:
+                return Decision(False, message)
 
         if tool == "search_providers":
             if missing := e.request.missing(e.kind):
                 return Decision(False, f"missing required details: {', '.join(missing)}; ask the user")
             req = e.request
-            for field, given in (("service", args.get("service")), ("area", args.get("area"))):
-                if getattr(req, field) is not None and given != getattr(req, field):
+            for field in ("service", "area"):
+                if getattr(req, field) is not None and args.get(field) != getattr(req, field):
                     return Decision(False, f"{field} differs from the recorded request; call update_request first")
-            if req.date_range is not None and _norm_range(args.get("date_range")) != tuple(req.date_range):
+            try:
+                given = split_date_range(args.get("date_range"))
+            except ValueError:
+                given = None
+            if req.date_range is not None and given != tuple(req.date_range):
                 return Decision(False, "date_range differs from the recorded request; call update_request first")
-        elif tool == "get_provider":
-            if not ref("provider", args.get("provider_id", "")):
-                return Decision(False, "unknown provider_id; use one returned by search_providers")
-        elif tool == "hold_slot":
-            if e.kind not in (ErrandKind.BOOK, ErrandKind.REBOOK):
-                return Decision(False, f"hold_slot is not used for a {e.kind}")
-            pid = args.get("provider_id", "")
-            if not ref("provider", pid):
-                return Decision(False, "unknown provider_id; use one returned by search_providers")
-            if not ref("slot", f"{pid}|{args.get('slot')}"):
-                return Decision(False, "that slot was not offered by this provider")
-        elif tool == "list_bookings":
-            if args.get("user_id") != e.user_id:
-                return Decision(False, "list_bookings is only allowed for the current user")
+        elif tool == "list_bookings" and args.get("user_id") != e.user_id:
+            return Decision(False, "list_bookings is only allowed for the current user")
         elif tool == "request_approval":
             try:
                 action = Action(args.get("action"))
@@ -97,17 +93,10 @@ class Gate:
         approval = self.store.approval_by_hash(exe.errand_id, current.approval_hash)
         if approval is None or approval.status != ApprovalStatus.CONSUMED:
             return Decision(False, "no consumed approval backs this execution")
-        if args.get("idempotency_key") != current.idem_key:
-            return Decision(False, "idempotency key does not match the write-ahead record")
-        bound = {k: current.payload[k] for k in ("hold_id", "booking_id", "slot")
-                 if k in current.payload and k in args}
-        if any(args[k] != v for k, v in bound.items()):
-            return Decision(False, "arguments differ from the approved payload")
+        if args != side_effect_args(current.action, current.payload, current.idem_key):
+            return Decision(False, "arguments or idempotency key differ from the write-ahead record")
         if current.retries > self.limits.max_tool_retries:
             return Decision(False, "retry budget exhausted")
-        if tool == "book":
-            others = [x for x in self.store.executions_for(exe.errand_id, Action.BOOK)
-                      if x.id != exe.id and x.state in GUARD_STATES]
-            if others:
-                return Decision(False, "this errand already has a booking in flight or confirmed")
+        if tool == "book" and self.store.other_guarded_booking(exe.errand_id, exe.id):
+            return Decision(False, "this errand already has a booking in flight or confirmed")
         return Decision(True)

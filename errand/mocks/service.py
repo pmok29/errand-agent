@@ -6,17 +6,16 @@ are honoured server-side, and faults are driven by a seeded ScenarioConfig.
 from __future__ import annotations
 
 import hashlib
-import json
 import random
-import sqlite3
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
-from errand.clock import Clock
+from errand.clock import Clock, is_expired
+from errand.db import DB
 from errand.mocks.catalog import AREAS, CATALOG, SEED_BOOKINGS, SERVICES, availability, days
 from errand.mocks.scenario import BOOK_OUTCOMES, BOOK_WEIGHTS, ScenarioConfig
-from errand.models import ToolResult, ToolTimeout
+from errand.models import ToolResult, ToolTimeout, split_date_range
 
 HOLD_TTL_S = 600
 MAX_SEARCH_RESULTS = 8
@@ -40,8 +39,6 @@ CREATE TABLE IF NOT EXISTS provider_events (
 );
 """
 
-ACTIVE_BOOKING = ("confirmed",)
-
 
 def _payload_hash(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
@@ -52,21 +49,20 @@ class MockProviderService:
                  user_id: str = "u1"):
         self.clock = clock
         self.scenario = scenario or ScenarioConfig()
-        self.conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        if self.conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0] == 0:
+        self.db = DB(path, SCHEMA)
+        self.conn = self.db.conn
+        if self.db.one("SELECT COUNT(*) AS n FROM bookings")["n"] == 0:
             for b in SEED_BOOKINGS:
                 if b["user_id"] == user_id:
                     self._insert_booking(**b, hold_id=None)
 
     # ---------- helpers ----------
-    def _counter(self, name: str, bump: bool = True) -> int:
-        row = self.conn.execute("SELECT count FROM fault_counters WHERE name=?", (name,)).fetchone()
+    def _counter(self, name: str) -> int:
+        """Returns the current count for `name` and increments it (persisted across restarts)."""
+        row = self.db.one("SELECT count FROM fault_counters WHERE name=?", name)
         n = row["count"] if row else 0
-        if bump:
-            self.conn.execute("INSERT INTO fault_counters VALUES (?, ?) ON CONFLICT(name) "
-                              "DO UPDATE SET count=excluded.count", (name, n + 1))
+        self.conn.execute("INSERT INTO fault_counters VALUES (?, ?) ON CONFLICT(name) "
+                          "DO UPDATE SET count=excluded.count", (name, n + 1))
         return n
 
     def _rng(self, tool: str) -> random.Random:
@@ -86,7 +82,7 @@ class MockProviderService:
                           (booking_id, user_id, provider_id, service, slot, price, status, hold_id))
 
     def _idem_lookup(self, key: str, action: str, payload: str) -> ToolResult | None:
-        row = self.conn.execute("SELECT * FROM idem WHERE key=?", (key,)).fetchone()
+        row = self.db.one("SELECT * FROM idem WHERE key=?", key)
         if row is None:
             return None
         if self.scenario.strict_idempotency and (row["action"] != action or row["payload_hash"] != payload):
@@ -120,11 +116,7 @@ class MockProviderService:
 
     @staticmethod
     def _parse_range(date_range) -> tuple[date, date]:
-        if isinstance(date_range, dict):
-            date_range = (date_range.get("start"), date_range.get("end"))
-        if isinstance(date_range, str):
-            date_range = date_range.split("..")
-        start, end = (date.fromisoformat(str(x)) for x in date_range)
+        start, end = (date.fromisoformat(x) for x in split_date_range(date_range))
         if end < start:
             raise ValueError("date_range end before start")
         return start, end
@@ -188,10 +180,10 @@ class MockProviderService:
         payload = _payload_hash(hold_id)
         if (replay := self._idem_lookup(idempotency_key, "book", payload)) is not None:
             return replay
-        hold = self.conn.execute("SELECT * FROM holds WHERE hold_id=?", (hold_id,)).fetchone()
+        hold = self.db.one("SELECT * FROM holds WHERE hold_id=?", hold_id)
         if hold is None:
             return ToolResult.fail("hold_not_found")
-        if hold["status"] != "active" or datetime.fromisoformat(hold["expires_at"]) <= self.clock.now():
+        if hold["status"] != "active" or is_expired(hold["expires_at"], self.clock.now()):
             return self._idem_store(idempotency_key, "book", payload,
                                     ToolResult.fail("hold_expired", message="hold is no longer valid"))
         outcome = self._next_book_outcome()
@@ -219,15 +211,14 @@ class MockProviderService:
         if self._counter("status_pending") < self.scenario.status_pending_checks:
             return ToolResult.success(status="pending")
         if idempotency_key is not None:
-            row = self.conn.execute("SELECT * FROM idem WHERE key=? AND action='book'",
-                                    (idempotency_key,)).fetchone()
+            row = self.db.one("SELECT * FROM idem WHERE key=? AND action='book'", idempotency_key)
             if row is not None:
                 stored = ToolResult.model_validate_json(row["result_json"])
                 if stored.ok:
                     return ToolResult.success(status="booked", booking_id=stored.data["booking_id"])
                 return ToolResult.success(status="not_booked", reason=stored.error.code)
             return ToolResult.success(status="not_booked")
-        b = self.conn.execute("SELECT booking_id FROM bookings WHERE hold_id=?", (hold_id,)).fetchone()
+        b = self.db.one("SELECT booking_id FROM bookings WHERE hold_id=?", hold_id)
         return ToolResult.success(status="booked", booking_id=b["booking_id"]) if b \
             else ToolResult.success(status="not_booked")
 
@@ -236,13 +227,13 @@ class MockProviderService:
         payload = _payload_hash(booking_id)
         if (replay := self._idem_lookup(idempotency_key, "cancel", payload)) is not None:
             return replay
-        b = self.conn.execute("SELECT * FROM bookings WHERE booking_id=?", (booking_id,)).fetchone()
+        b = self.db.one("SELECT * FROM bookings WHERE booking_id=?", booking_id)
         if b is None:
             return ToolResult.fail("not_found", message=f"no booking {booking_id}")
         attempts = self._counter(f"cancel:{booking_id}")
         if self.scenario.cancel_always_fail or (self.scenario.cancel_fail_first and attempts == 0):
             return ToolResult.fail("service_unavailable", retryable=True, message="503 Service Unavailable")
-        if b["status"] not in ACTIVE_BOOKING:
+        if b["status"] != "confirmed":
             return self._idem_store(idempotency_key, "cancel", payload,
                                     ToolResult.fail("not_cancellable", message=f"booking is {b['status']}"))
         self.conn.execute("UPDATE bookings SET status='cancelled' WHERE booking_id=?", (booking_id,))
@@ -254,10 +245,10 @@ class MockProviderService:
         payload = _payload_hash(booking_id, slot)
         if (replay := self._idem_lookup(idempotency_key, "reschedule", payload)) is not None:
             return replay
-        b = self.conn.execute("SELECT * FROM bookings WHERE booking_id=?", (booking_id,)).fetchone()
+        b = self.db.one("SELECT * FROM bookings WHERE booking_id=?", booking_id)
         if b is None:
             return ToolResult.fail("not_found", message=f"no booking {booking_id}")
-        if b["status"] not in ACTIVE_BOOKING:
+        if b["status"] != "confirmed":
             return self._idem_store(idempotency_key, "reschedule", payload,
                                     ToolResult.fail("not_reschedulable", message=f"booking is {b['status']}"))
         day = date.fromisoformat(slot[:10])

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from errand.agent.keys import idem_key, payload_hash
 from errand.clock import Clock
 from errand.db import DB, new_id
 from errand.models import (Action, Approval, ApprovalDraft, ApprovalStatus, Errand, ErrandKind,
@@ -14,6 +15,15 @@ OPEN_STATES = {ErrandState.GATHERING, ErrandState.COMPARING, ErrandState.HOLDING
                ErrandState.AWAITING_APPROVAL, ErrandState.EXECUTING, ErrandState.VERIFYING}
 # Execution states that block another book on the same errand (the errand guard)
 GUARD_STATES = {ExecState.EXECUTING, ExecState.VERIFYING, ExecState.DONE, ExecState.UNVERIFIED}
+
+
+def slot_ref(provider_id: str, slot: str) -> str:
+    """Key under which an offered (provider, slot) pair is remembered in seen_refs."""
+    return f"{provider_id}|{slot}"
+
+
+def _placeholders(values) -> str:
+    return ",".join("?" * len(values))
 
 
 class StaleErrand(Exception):
@@ -60,12 +70,10 @@ class Store:
         return self._errand(self.db.one("SELECT * FROM errands WHERE id=?", errand_id))
 
     def active_errand(self, session_id: str) -> Errand | None:
-        rows = self.db.all("SELECT * FROM errands WHERE session_id=? ORDER BY created_at DESC, rowid DESC",
-                           session_id)
-        for r in rows:
-            if r["state"] in OPEN_STATES:
-                return self._errand(r)
-        return None
+        states = [str(s) for s in OPEN_STATES]
+        row = self.db.one(f"SELECT * FROM errands WHERE session_id=? AND state IN ({_placeholders(states)}) "
+                          "ORDER BY rowid DESC LIMIT 1", session_id, *states)
+        return self._errand(row) if row else None
 
     def save_errand(self, e: Errand) -> Errand:
         cur = self.db.conn.execute(
@@ -79,9 +87,11 @@ class Store:
         return e
 
     # ---------- seen references (provenance) ----------
-    def add_ref(self, errand_id: str, kind: str, ref: str, meta: dict[str, Any]) -> None:
-        self.db.conn.execute("INSERT INTO seen_refs VALUES (?,?,?,?) ON CONFLICT DO UPDATE SET "
-                             "meta_json=excluded.meta_json", (errand_id, kind, ref, json.dumps(meta)))
+    def add_refs(self, errand_id: str, refs: list[tuple[str, str, dict[str, Any]]]) -> None:
+        with self.db.tx() as c:
+            c.executemany("INSERT INTO seen_refs VALUES (?,?,?,?) ON CONFLICT DO UPDATE SET "
+                          "meta_json=excluded.meta_json",
+                          [(errand_id, kind, ref, json.dumps(meta)) for kind, ref, meta in refs])
 
     def ref(self, errand_id: str, kind: str, ref: str) -> dict[str, Any] | None:
         row = self.db.one("SELECT meta_json FROM seen_refs WHERE errand_id=? AND kind=? AND ref=?",
@@ -92,29 +102,35 @@ class Store:
         """Remember every ID a tool result showed us; the gate rejects IDs that never appeared."""
         if not result.ok:
             return
-        d = result.data
+        d, refs = result.data, []
         if tool == "search_providers" and isinstance(d.get("providers"), list):
             for p in d["providers"]:
-                self.add_ref(errand_id, "provider", p["provider_id"], {"name": p["name"], "price": p["price"]})
-                for s in p.get("slots", []):
-                    self.add_ref(errand_id, "slot", f"{p['provider_id']}|{s}", {})
+                refs.append(("provider", p["provider_id"], {"name": p["name"], "price": p["price"]}))
+                refs += [("slot", slot_ref(p["provider_id"], s), {}) for s in p.get("slots", [])]
         elif tool == "get_provider" and "provider_id" in d:
-            self.add_ref(errand_id, "provider", d["provider_id"], {"name": d["name"], "price": d["price"]})
+            refs.append(("provider", d["provider_id"], {"name": d["name"], "price": d["price"]}))
         elif tool == "list_bookings" and isinstance(d.get("bookings"), list):
             for b in d["bookings"]:
                 prov = b["provider"]
-                self.add_ref(errand_id, "booking", b["booking_id"],
+                refs.append(("booking", b["booking_id"],
                              {"provider_id": prov["provider_id"], "provider_name": prov["name"],
                               "service": b["service"], "slot": b["slot"], "price": b.get("price"),
-                              "status": b["status"]})
-                self.add_ref(errand_id, "provider", prov["provider_id"],
-                             {"name": prov["name"], "price": b.get("price")})
+                              "status": b["status"]}))
+                refs.append(("provider", prov["provider_id"], {"name": prov["name"], "price": b.get("price")}))
+        if refs:
+            self.add_refs(errand_id, refs)
 
     # ---------- holds ----------
-    def add_hold(self, h: Hold) -> None:
+    def record_hold(self, errand_id: str, provider_id: str, slot: str, result: ToolResult,
+                    search_price: int | None) -> Hold:
+        """Persist a successful hold_slot result."""
+        h = Hold(hold_id=result.data["hold_id"], errand_id=errand_id, provider_id=provider_id, slot=slot,
+                 quoted_price=result.data["quoted_price"], search_price=search_price,
+                 expires_at=result.data["expires_at"])
         self.db.conn.execute("INSERT INTO holds VALUES (?,?,?,?,?,?,?)",
                              (h.hold_id, h.errand_id, h.provider_id, h.slot, h.quoted_price,
                               h.search_price, h.expires_at))
+        return h
 
     def latest_hold(self, errand_id: str) -> Hold | None:
         row = self.db.one("SELECT * FROM holds WHERE errand_id=? ORDER BY rowid DESC LIMIT 1", errand_id)
@@ -144,6 +160,11 @@ class Store:
     def approval_by_hash(self, errand_id: str, hash: str) -> Approval | None:
         row = self.db.one("SELECT * FROM approvals WHERE errand_id=? AND hash=? ORDER BY rowid DESC LIMIT 1",
                           errand_id, hash)
+        return self._approval(row) if row else None
+
+    def approval_by_code(self, errand_id: str, code: str) -> Approval | None:
+        row = self.db.one("SELECT * FROM approvals WHERE errand_id=? AND code=? ORDER BY rowid DESC LIMIT 1",
+                          errand_id, code)
         return self._approval(row) if row else None
 
     def set_approval_status(self, approval_id: str, status: ApprovalStatus) -> None:
@@ -182,6 +203,23 @@ class Store:
         if action:
             sql, args = sql + " AND action=?", args + [action]
         return [self._execution(r) for r in self.db.all(sql + " ORDER BY attempt_no", *args)]
+
+    def open_execution(self, errand_id: str, action: Action, payload: dict[str, Any], approval_hash: str,
+                       parent_execution_id: str | None = None) -> Execution:
+        """Insert the write-ahead record for the next attempt: attempt_no, key and payload hash derived here only."""
+        attempt = self.next_attempt_no(errand_id, action)
+        x = Execution(id=new_id("x"), errand_id=errand_id, action=action, attempt_no=attempt,
+                      idem_key=idem_key(errand_id, action, attempt), payload_hash=payload_hash(payload),
+                      approval_hash=approval_hash, parent_execution_id=parent_execution_id, payload=payload,
+                      state=ExecState.EXECUTING)
+        self.insert_execution(x)
+        return x
+
+    def other_guarded_booking(self, errand_id: str, exclude_id: str) -> bool:
+        """Errand guard: does another book execution on this errand block a new one?"""
+        states = [str(s) for s in GUARD_STATES]
+        return self.db.one(f"SELECT 1 FROM executions WHERE errand_id=? AND action='book' AND id<>? "
+                           f"AND state IN ({_placeholders(states)}) LIMIT 1", errand_id, exclude_id, *states) is not None
 
     def next_attempt_no(self, errand_id: str, action: Action) -> int:
         row = self.db.one("SELECT MAX(attempt_no) AS n FROM executions WHERE errand_id=? AND action=?",

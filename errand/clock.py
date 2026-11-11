@@ -7,6 +7,11 @@ from typing import Protocol
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+def is_expired(expires_at: str, now: datetime) -> bool:
+    """Single expiry rule for holds and approvals: expired at the exact expiry instant."""
+    return datetime.fromisoformat(expires_at) <= now
+
+
 class Clock(Protocol):
     def now(self) -> datetime: ...
     def sleep(self, seconds: float) -> None: ...

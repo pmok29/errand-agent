@@ -10,25 +10,22 @@ Rules:
 from __future__ import annotations
 
 import time
-from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 
 from errand.agent import approvals
+from errand.agent.gate import Gate
+from errand.agent.keys import side_effect_args
 from errand.agent.state import transition
 from errand.agent.store import Store
-from errand.agent.gate import Gate
-from errand.agent.keys import idem_key, payload_hash
 from errand.agent.templates import Outcome
-from errand.clock import Clock
+from errand.clock import Clock, is_expired
 from errand.config import Limits, Settings
-from errand.db import new_id
-from errand.models import (Action, ApprovalDraft, ErrandState as S, Execution, ExecState, Hold,
-                           ToolResult, ToolTimeout)
+from errand.models import (Action, ApprovalDraft, ErrandState as S, Execution, ExecState, ToolResult,
+                           ToolTimeout)
 from errand.tracing.tracer import Tracer
 
 ToolCall = Callable[[str, dict], ToolResult]
 MAX_ATTEMPTS = 3          # re-hold chain length for one approval
-_RETRY = object()         # sentinel from verify: retry the same key
 
 
 class SimulatedCrash(Exception):
@@ -42,65 +39,13 @@ class Executor:
         self.settings = settings or Settings()
         self.limits: Limits = self.settings.limits
         self.faults = faults or set()
-
-    # ---------- plumbing ----------
-    def _fault(self, point: str) -> None:
-        if point in self.faults:
-            self.faults.discard(point)
-            raise SimulatedCrash(point)
-
-    def _invoke(self, exe: Execution, tool: str, args: dict) -> tuple[ToolResult | None, bool]:
-        """Call a tool with tracing. Returns (result, timed_out)."""
-        t0 = time.perf_counter()
-        try:
-            result, timed_out = self.call(tool, args), False
-        except ToolTimeout:
-            result, timed_out = None, True
-        self.tracer.emit("tool_call", actor="executor", errand_id=exe.errand_id, execution_id=exe.id,
-                         tool=tool, args=args, attempt_no=exe.attempt_no, retry=exe.retries,
-                         latency_ms=round((time.perf_counter() - t0) * 1000, 2), timed_out=timed_out,
-                         result=result.model_dump() if result else None)
-        return result, timed_out
-
-    def _side_effect(self, exe: Execution, tool: str, args: dict) -> tuple[ToolResult | None, bool, str | None]:
-        d = self.gate.check_side_effect(exe, tool, args)
-        if not d.allow:
-            return None, False, d.reason
-        r, timed_out = self._invoke(exe, tool, args)
-        return r, timed_out, None
-
-    def _set(self, exe: Execution, state: ExecState, **changes) -> None:
-        exe.state = state
-        for k, v in changes.items():
-            setattr(exe, k, v)
-        self.store.update_execution(exe)
-        self.tracer.emit("execution_update", execution_id=exe.id, errand_id=exe.errand_id, state=state,
-                         attempt_no=exe.attempt_no, retries=exe.retries, last_error=exe.last_error)
-
-    def _errand_to(self, exe: Execution, to: S, reason: str):
-        e = self.store.get_errand(exe.errand_id)
-        return transition(self.store, self.tracer, e, to, reason)
-
-    def _draft(self, exe: Execution) -> ApprovalDraft:
-        return self.store.approval_by_hash(exe.errand_id, exe.approval_hash).draft
-
-    def _fail(self, exe: Execution, reason: str, kind: str = "failed") -> Outcome:
-        self._set(exe, ExecState.FAILED, last_error=reason)
-        self._errand_to(exe, S.FAILED, reason)
-        return Outcome(kind, exe.errand_id, {"reason": reason})
-
-    def _backoff(self, i: int) -> float:
-        b = self.limits.status_poll_backoff_s
-        return b[min(i, len(b) - 1)]
+        self._handlers = {Action.BOOK: self._book, Action.CANCEL: self._cancel,
+                          Action.RESCHEDULE: self._reschedule}
 
     # ---------- entry points ----------
     def run(self, exe: Execution) -> Outcome:
         try:
-            if exe.action == Action.BOOK:
-                return self._book(exe)
-            if exe.action == Action.CANCEL:
-                return self._cancel(exe)
-            return self._reschedule(exe)
+            return self._handlers[exe.action](exe)
         except SimulatedCrash:
             raise
         except Exception as err:  # unexpected tool/agent error: fail closed with a clear outcome
@@ -109,182 +54,200 @@ class Executor:
 
     def resume(self, exe: Execution) -> Outcome:
         """Recovery after a restart: always consult the source of truth before calling again."""
-        if exe.action == Action.BOOK:
-            return self._book(exe, verify_first=True)
-        if exe.action == Action.CANCEL:
-            return self._cancel(exe, verify_first=True)
-        return self._reschedule(exe, verify_first=True)
+        return self._handlers[exe.action](exe, verify_first=True)
+
+    # ---------- plumbing ----------
+    def _fault(self, point: str) -> None:
+        if point in self.faults:
+            self.faults.discard(point)
+            raise SimulatedCrash(point)
+
+    def _invoke(self, exe: Execution, tool: str, args: dict) -> ToolResult | None:
+        """Call a tool with tracing. None means the call timed out."""
+        t0 = time.perf_counter()
+        try:
+            result = self.call(tool, args)
+        except ToolTimeout:
+            result = None
+        self.tracer.emit("tool_call", actor="executor", errand_id=exe.errand_id, execution_id=exe.id,
+                         tool=tool, args=args, attempt_no=exe.attempt_no, retry=exe.retries,
+                         latency_ms=round((time.perf_counter() - t0) * 1000, 2), timed_out=result is None,
+                         result=result.model_dump() if result else None)
+        return result
+
+    def _side_effect(self, exe: Execution) -> tuple[ToolResult | None, str | None]:
+        """Run the execution's side effect through the gate. Returns (result or None on timeout, denial)."""
+        args = side_effect_args(exe.action, exe.payload, exe.idem_key)
+        d = self.gate.check_side_effect(exe, exe.action, args)
+        if not d.allow:
+            return None, d.reason
+        return self._invoke(exe, exe.action, args), None
+
+    def _move(self, exe: Execution, exec_state: ExecState, errand_state: S | None, reason: str,
+              booking_id: str | None = None, **changes: Any) -> None:
+        """Update the execution and its errand together, atomically."""
+        with self.store.db.tx():
+            exe.state = exec_state
+            for k, v in changes.items():
+                setattr(exe, k, v)
+            self.store.update_execution(exe)
+            if errand_state is not None:
+                e = self.store.get_errand(exe.errand_id)
+                if booking_id:
+                    e.booking_id = booking_id
+                    if e.state == errand_state:
+                        self.store.save_errand(e)
+                transition(self.store, self.tracer, e, errand_state, reason)
+        self.tracer.emit("execution_update", execution_id=exe.id, errand_id=exe.errand_id, state=exec_state,
+                         attempt_no=exe.attempt_no, retries=exe.retries, last_error=exe.last_error)
+
+    def _draft(self, exe: Execution) -> ApprovalDraft:
+        return self.store.approval_by_hash(exe.errand_id, exe.approval_hash).draft
+
+    def _fail(self, exe: Execution, reason: str, kind: str = "failed") -> Outcome:
+        self._move(exe, ExecState.FAILED, S.FAILED, reason, last_error=reason)
+        return Outcome(kind, exe.errand_id, {"reason": reason})
+
+    def _back_to_compare(self, exe: Execution, code: str, data: dict) -> Outcome:
+        """A processed failure: close this attempt and let the user pick something else."""
+        self._move(exe, ExecState.FAILED, S.COMPARING, code, last_error=code)
+        return Outcome(code, exe.errand_id, data)
+
+    def _done(self, exe: Execution, kind: str, data: dict, booking_id: str) -> Outcome:
+        """Verified success. The outcome is saved so later status messages re-render it verbatim."""
+        self._move(exe, ExecState.DONE, S.DONE, f"{kind}_verified", booking_id=booking_id,
+                   result={"booking_id": booking_id, "outcome": {"kind": kind, "data": data}})
+        return Outcome(kind, exe.errand_id, data)
+
+    def _backoff(self, i: int) -> float:
+        b = self.limits.status_poll_backoff_s
+        return b[min(i, len(b) - 1)]
 
     # ---------- book ----------
     def _book(self, exe: Execution, verify_first: bool = False) -> Outcome:
         while True:
             if not verify_first:
-                r, timed_out, denied = self._side_effect(
-                    exe, "book", {"hold_id": exe.payload["hold_id"], "idempotency_key": exe.idem_key})
+                r, denied = self._side_effect(exe)
                 if denied:
                     return self._fail(exe, f"denied: {denied}")
                 self._fault("book_returned")
-                if not timed_out and not r.ok:
+                if r is not None and not r.ok:
                     return self._book_error(exe, r)
             verify_first = False
-            if exe.state != ExecState.VERIFYING:
-                self._set(exe, ExecState.VERIFYING)
-            self._errand_to(exe, S.VERIFYING, "verify_booking")
+            self._move(exe, ExecState.VERIFYING, S.VERIFYING, "verify_booking")
             out = self._verify_book(exe)
-            if out is not _RETRY:
+            if out is not None:
                 return out
-            self._set(exe, ExecState.EXECUTING, retries=exe.retries + 1)
-            self._errand_to(exe, S.EXECUTING, "retry_same_key")
+            self._move(exe, ExecState.EXECUTING, S.EXECUTING, "retry_same_key", retries=exe.retries + 1)
 
     def _book_error(self, exe: Execution, r: ToolResult) -> Outcome:
         code = r.error.code
         if code == "slot_taken":
-            self._set(exe, ExecState.FAILED, last_error=code)
-            self._errand_to(exe, S.COMPARING, code)
-            return Outcome("slot_taken", exe.errand_id, {"slot": exe.payload["slot"]})
+            return self._back_to_compare(exe, code, {"slot": exe.payload["slot"]})
         if code == "hold_expired":
             return self._rehold(exe)
         return self._fail(exe, code)
 
-    def _verify_book(self, exe: Execution):
+    def _verify_book(self, exe: Execution) -> Outcome | None:
+        """Ask the source of truth. Returns an Outcome, or None to retry with the same key."""
         polls = len(self.limits.status_poll_backoff_s) + 1
         for i in range(polls):
-            s, timed_out = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
+            s = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
             status = s.data.get("status") if (s and s.ok) else None
             if status == "booked":
-                booking_id = s.data["booking_id"]
-                self._set(exe, ExecState.DONE, result={"booking_id": booking_id})
-                e = self.store.get_errand(exe.errand_id)
-                e.booking_id = booking_id
-                self.store.save_errand(e)
-                self._errand_to(exe, S.DONE, "booking_verified")
                 d = self._draft(exe)
-                return Outcome("booked", exe.errand_id, {"provider_name": d.provider_name, "slot": d.slot,
-                                                         "price": exe.payload["price"], "booking_id": booking_id})
+                booking_id = s.data["booking_id"]
+                return self._done(exe, "booked", {"provider_name": d.provider_name, "slot": d.slot,
+                                                  "price": exe.payload["price"], "booking_id": booking_id}, booking_id)
             if status == "not_booked":
                 if s.data.get("reason"):  # the provider processed and rejected it
                     return self._book_error(exe, ToolResult.fail(s.data["reason"]))
-                hold = self.store.get_hold(exe.payload["hold_id"])
-                if datetime.fromisoformat(hold.expires_at) <= self.clock.now():
+                if is_expired(self.store.get_hold(exe.payload["hold_id"]).expires_at, self.clock.now()):
                     return self._rehold(exe)
                 if exe.retries >= self.limits.max_tool_retries:
                     return self._fail(exe, "booking retries exhausted")
-                return _RETRY
+                return None
             if i < polls - 1:  # pending, or the status call itself failed: back off and ask again
                 self.clock.sleep(self._backoff(i))
-        self._set(exe, ExecState.UNVERIFIED, last_error="status still pending")
-        self._errand_to(exe, S.UNVERIFIED, "status_pending")
+        self._move(exe, ExecState.UNVERIFIED, S.UNVERIFIED, "status_pending", last_error="status still pending")
         return Outcome("unverified", exe.errand_id)
 
     def _rehold(self, exe: Execution) -> Outcome:
-        self._set(exe, ExecState.FAILED, last_error="hold_expired")
+        self._move(exe, ExecState.FAILED, None, "hold_expired", last_error="hold_expired")
         if exe.attempt_no >= MAX_ATTEMPTS:
             return self._fail(exe, "hold kept expiring")
         draft = self._draft(exe)
-        r, _ = self._invoke(exe, "hold_slot", {"provider_id": draft.provider_id, "slot": draft.slot})
+        r = self._invoke(exe, "hold_slot", {"provider_id": draft.provider_id, "slot": draft.slot})
         if r is None or not r.ok:
-            self._errand_to(exe, S.COMPARING, "rehold_failed")
-            return Outcome("slot_unavailable", exe.errand_id, {"slot": draft.slot})
+            return self._back_to_compare(exe, "slot_unavailable", {"slot": draft.slot})
         prev = self.store.get_hold(exe.payload["hold_id"])
-        self.store.add_hold(Hold(hold_id=r.data["hold_id"], errand_id=exe.errand_id, provider_id=draft.provider_id,
-                                 slot=draft.slot, quoted_price=r.data["quoted_price"],
-                                 search_price=prev.search_price if prev else None, expires_at=r.data["expires_at"]))
-        if r.data["quoted_price"] != draft.price:
+        hold = self.store.record_hold(exe.errand_id, draft.provider_id, draft.slot, r,
+                                      prev.search_price if prev else None)
+        if hold.quoted_price != draft.price:
             # material change: the old approval cannot cover this; ask again with a fresh card
-            self._errand_to(exe, S.AWAITING_APPROVAL, "price_changed_on_rehold")
+            self._move(exe, ExecState.FAILED, S.AWAITING_APPROVAL, "price_changed_on_rehold")
             e = self.store.get_errand(exe.errand_id)
             new_draft = approvals.build_draft(self.store, e, Action.BOOK)
             _, card = approvals.create(self.store, self.tracer, e, new_draft, self.settings.approval_ttl_s)
             return Outcome("needs_reapproval", exe.errand_id,
                            {"old_price": draft.price, "new_price": new_draft.price}, card=card)
         # material details unchanged: continue under the same approval with a new attempt and key
-        attempt = self.store.next_attempt_no(exe.errand_id, Action.BOOK)
-        payload = {"hold_id": r.data["hold_id"], "slot": draft.slot, "price": r.data["quoted_price"]}
-        child = Execution(id=new_id("x"), errand_id=exe.errand_id, action=Action.BOOK, attempt_no=attempt,
-                          idem_key=idem_key(exe.errand_id, Action.BOOK, attempt), payload_hash=payload_hash(payload),
-                          approval_hash=exe.approval_hash, parent_execution_id=exe.id, payload=payload,
-                          state=ExecState.EXECUTING)
-        self.store.insert_execution(child)
-        self.tracer.emit("execution_rehold", parent=exe.id, child=child.id, attempt_no=attempt)
-        self._errand_to(child, S.EXECUTING, "rehold_same_terms")
+        child = self.store.open_execution(exe.errand_id, Action.BOOK, approvals.book_payload(hold),
+                                          exe.approval_hash, parent_execution_id=exe.id)
+        self.tracer.emit("execution_rehold", parent=exe.id, child=child.id, attempt_no=child.attempt_no)
+        self._move(child, ExecState.EXECUTING, S.EXECUTING, "rehold_same_terms")
         return self._book(child)
 
-    # ---------- cancel ----------
+    # ---------- cancel / reschedule ----------
     def _booking_row(self, exe: Execution) -> dict | None:
         user = self.store.get_errand(exe.errand_id).user_id
-        r, _ = self._invoke(exe, "list_bookings", {"user_id": user})
+        r = self._invoke(exe, "list_bookings", {"user_id": user})
         if r is None or not r.ok:
             return None
         return next((b for b in r.data["bookings"] if b["booking_id"] == exe.payload["booking_id"]), None)
 
+    def _applied(self, exe: Execution, reflected: Callable[[dict], bool]) -> bool:
+        row = self._booking_row(exe)
+        return row is not None and reflected(row)
+
     def _cancel(self, exe: Execution, verify_first: bool = False) -> Outcome:
-        draft = self._draft(exe)
-        done = lambda: self._finish(exe, "cancelled", {"provider_name": draft.provider_name, "slot": draft.slot})  # noqa: E731
-        if verify_first:
-            row = self._booking_row(exe)
-            if row and row["status"] == "cancelled":
-                return done()
-            self._set(exe, ExecState.EXECUTING)
-            self._errand_to(exe, S.EXECUTING, "resume_cancel")
-        while True:
-            r, timed_out, denied = self._side_effect(
-                exe, "cancel", {"booking_id": exe.payload["booking_id"], "idempotency_key": exe.idem_key})
-            if denied:
-                return self._fail(exe, f"denied: {denied}")
-            if r is not None and r.ok:
-                row = self._booking_row(exe)
-                return done() if row and row["status"] == "cancelled" else self._fail(exe, "cancellation not reflected")
-            if timed_out:
-                row = self._booking_row(exe)
-                if row and row["status"] == "cancelled":
-                    return done()
-            elif not r.error.retryable:
-                return self._fail(exe, r.error.code)
-            if exe.retries >= self.limits.max_tool_retries:
-                return self._fail(exe, "cancel retries exhausted", kind="cancel_failed")
-            self._set(exe, ExecState.EXECUTING, retries=exe.retries + 1, last_error="transient")
-            self.clock.sleep(self._backoff(exe.retries - 1))
+        d = self._draft(exe)
+        return self._mutate_booking(exe, verify_first, lambda row: row["status"] == "cancelled",
+                                    "cancelled", {"provider_name": d.provider_name, "slot": d.slot},
+                                    exhausted_kind="cancel_failed")
 
-    # ---------- reschedule ----------
     def _reschedule(self, exe: Execution, verify_first: bool = False) -> Outcome:
-        draft = self._draft(exe)
-        new_slot = exe.payload["slot"]
-        done = lambda: self._finish(exe, "rescheduled", {"provider_name": draft.provider_name,  # noqa: E731
-                                                         "slot": new_slot, "old_slot": draft.old_slot})
+        d, new_slot = self._draft(exe), exe.payload["slot"]
+        return self._mutate_booking(exe, verify_first, lambda row: row["slot"] == new_slot,
+                                    "rescheduled", {"provider_name": d.provider_name, "slot": new_slot,
+                                                    "old_slot": d.old_slot},
+                                    conflict_code="slot_conflict")
+
+    def _mutate_booking(self, exe: Execution, verify_first: bool, reflected: Callable[[dict], bool],
+                        kind: str, data: dict, conflict_code: str | None = None,
+                        exhausted_kind: str = "failed") -> Outcome:
+        """Shared cancel/reschedule loop: side effect, verify via list_bookings, same-key retries."""
         if verify_first:
-            row = self._booking_row(exe)
-            if row and row["slot"] == new_slot:
-                return done()
-            self._set(exe, ExecState.EXECUTING)
-            self._errand_to(exe, S.EXECUTING, "resume_reschedule")
+            if self._applied(exe, reflected):
+                self._move(exe, ExecState.VERIFYING, S.VERIFYING, f"verify_{exe.action}")
+                return self._done(exe, kind, data, exe.payload["booking_id"])
+            self._move(exe, ExecState.EXECUTING, S.EXECUTING, f"resume_{exe.action}")
         while True:
-            r, timed_out, denied = self._side_effect(
-                exe, "reschedule", {"booking_id": exe.payload["booking_id"], "slot": new_slot,
-                                    "idempotency_key": exe.idem_key})
+            r, denied = self._side_effect(exe)
             if denied:
                 return self._fail(exe, f"denied: {denied}")
-            if r is not None and r.ok:
-                row = self._booking_row(exe)
-                return done() if row and row["slot"] == new_slot else self._fail(exe, "reschedule not reflected")
-            if timed_out:
-                row = self._booking_row(exe)
-                if row and row["slot"] == new_slot:
-                    return done()
-            elif r.error.code == "slot_conflict":
-                self._set(exe, ExecState.FAILED, last_error="slot_conflict")
-                self._errand_to(exe, S.COMPARING, "slot_conflict")
-                return Outcome("slot_conflict", exe.errand_id, {"slot": new_slot})
+            if r is None or r.ok:  # success or timeout: the booking list is the source of truth
+                self._move(exe, ExecState.VERIFYING, S.VERIFYING, f"verify_{exe.action}")
+                if self._applied(exe, reflected):
+                    return self._done(exe, kind, data, exe.payload["booking_id"])
+                if r is not None:
+                    return self._fail(exe, f"{exe.action} not reflected")
+            elif r.error.code == conflict_code:
+                return self._back_to_compare(exe, conflict_code, {"slot": exe.payload.get("slot")})
             elif not r.error.retryable:
                 return self._fail(exe, r.error.code)
             if exe.retries >= self.limits.max_tool_retries:
-                return self._fail(exe, "reschedule retries exhausted")
-            self._set(exe, ExecState.EXECUTING, retries=exe.retries + 1, last_error="transient")
+                return self._fail(exe, f"{exe.action} retries exhausted", kind=exhausted_kind)
+            self._move(exe, ExecState.EXECUTING, S.EXECUTING, "retry_same_key",
+                       retries=exe.retries + 1, last_error="transient")
             self.clock.sleep(self._backoff(exe.retries - 1))
-
-    def _finish(self, exe: Execution, kind: str, data: dict) -> Outcome:
-        self._set(exe, ExecState.DONE, result={"booking_id": exe.payload["booking_id"]})
-        e = self.store.get_errand(exe.errand_id)
-        if e.state != S.VERIFYING:
-            e = transition(self.store, self.tracer, e, S.VERIFYING, "verify")
-        transition(self.store, self.tracer, e, S.DONE, f"{kind}_verified")
-        return Outcome(kind, exe.errand_id, data)

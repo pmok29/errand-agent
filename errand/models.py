@@ -85,6 +85,19 @@ class ToolTimeout(Exception):
     """Raised by a mock tool when the call times out (the side effect may still have happened)."""
 
 
+def split_date_range(value: Any) -> tuple[str, str]:
+    """Accepts {"start","end"}, "a..b", or a 2-sequence. Raises ValueError on anything else."""
+    if isinstance(value, dict):
+        value = (value.get("start"), value.get("end"))
+    if isinstance(value, str):
+        value = value.split("..")
+    try:
+        start, end = value
+    except (TypeError, ValueError):
+        raise ValueError(f"bad date_range {value!r}") from None
+    return str(start).strip(), str(end).strip()
+
+
 class Request(BaseModel):
     service: str | None = None
     area: str | None = None

@@ -4,7 +4,7 @@ import pytest
 from errand.agent import approvals, claim_guard
 from errand.agent.keys import idem_key
 from errand.agent.state import NO_LLM_STATES, TOOLS_BY_STATE, IllegalTransition, transition
-from errand.mocks.tools import SIDE_EFFECT_TOOLS
+from errand.contract import SIDE_EFFECT_TOOLS
 from errand.models import Action, ApprovalStatus, ErrandKind, ErrandState as S, ExecState
 
 

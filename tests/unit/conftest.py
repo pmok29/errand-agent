@@ -15,10 +15,9 @@ from errand.db import DB
 from errand.mocks import tools
 from errand.mocks.scenario import ScenarioConfig
 from errand.mocks.service import MockProviderService
-from errand.models import Action, ErrandKind, ErrandState as S, Hold, Request
+from errand.models import Action, ErrandKind, ErrandState as S, Request
 from errand.tracing.tracer import Tracer
-
-WEEK = ("2026-11-10", "2026-11-16")
+from tests.unit.common import WEEK
 
 
 @dataclass
@@ -64,9 +63,7 @@ class World:
         res = self.search(e)
         p = next(p for p in res.data["providers"] if p["provider_id"] == provider_id)
         r = self.call("hold_slot", {"provider_id": provider_id, "slot": p["slots"][slot_index]})
-        self.store.add_hold(Hold(hold_id=r.data["hold_id"], errand_id=e.id, provider_id=provider_id,
-                                 slot=p["slots"][slot_index], quoted_price=r.data["quoted_price"],
-                                 search_price=p["price"], expires_at=r.data["expires_at"]))
+        self.store.record_hold(e.id, provider_id, p["slots"][slot_index], r, p["price"])
         if e.state == S.GATHERING:
             transition(self.store, self.tracer, e, S.COMPARING, "test")
         transition(self.store, self.tracer, e, S.HOLDING, "test")
@@ -85,6 +82,9 @@ class World:
         res = approvals.consume(self.store, self.tracer, e, a.code)
         assert res.status == "ok"
         return self.store.get_errand(e.id), res.execution
+
+    def booking(self, booking_id: str) -> dict:
+        return next(b for b in self.mock.ledger() if b["booking_id"] == booking_id)
 
     def bookings_for_hold(self, hold_id: str) -> int:
         return sum(1 for b in self.mock.ledger() if b["hold_id"] == hold_id)

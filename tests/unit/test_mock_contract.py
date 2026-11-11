@@ -9,8 +9,7 @@ from errand.mocks.catalog import AREAS, SERVICES
 from errand.mocks.scenario import ScenarioConfig, preset
 from errand.mocks.service import MockProviderService
 from errand.models import ToolTimeout
-
-WEEK = ["2026-11-10", "2026-11-16"]
+from tests.unit.common import WEEK
 
 
 @pytest.fixture

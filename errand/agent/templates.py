@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from errand.agent.approvals import fmt_slot
+from errand.agent.approvals import fmt_money, fmt_slot
 from errand.agent.store import Store
 from errand.models import ApprovalStatus, Errand, ErrandState, ExecState
 
@@ -17,16 +17,12 @@ class Outcome:
     card: dict | None = None
 
 
-def _money(v) -> str:
-    return f"₹{v:,}" if v is not None else ""
-
-
 def render(o: Outcome) -> str:
     d = o.data
     slot = fmt_slot(d["slot"]) if d.get("slot") else ""
     match o.kind:
         case "booked":
-            return (f"Booked: {d['provider_name']} on {slot} for {_money(d.get('price'))}. "
+            return (f"Booked: {d['provider_name']} on {slot} for {fmt_money(d.get('price'))}. "
                     f"Confirmed with the provider (booking {d['booking_id']}).")
         case "cancelled":
             return f"Cancelled: your {d['provider_name']} booking on {slot}. Confirmed with the provider."
@@ -40,8 +36,8 @@ def render(o: Outcome) -> str:
         case "slot_unavailable":
             return "The hold expired and that slot is no longer free. Nothing was booked. Let's pick another slot."
         case "needs_reapproval":
-            return (f"The hold expired and the provider now quotes {_money(d.get('new_price'))} "
-                    f"instead of {_money(d.get('old_price'))}. Nothing was booked; please confirm the new price.")
+            return (f"The hold expired and the provider now quotes {fmt_money(d.get('new_price'))} "
+                    f"instead of {fmt_money(d.get('old_price'))}. Nothing was booked; please confirm the new price.")
         case "unverified":
             return ("The provider didn't confirm in time, so I can't tell yet whether the booking went through. "
                     "I have not made a second booking, and I'll check again and let you know.")
@@ -68,11 +64,9 @@ def render(o: Outcome) -> str:
 
 
 def _done_outcome(store: Store, e: Errand) -> Outcome:
+    """Re-render the outcome the executor saved on the execution when it verified success."""
     exe = [x for x in store.executions_for(e.id) if x.state == ExecState.DONE][-1]
-    draft = store.approval_by_hash(e.id, exe.approval_hash).draft
-    kind = {"book": "booked", "cancel": "cancelled", "reschedule": "rescheduled"}[exe.action]
-    return Outcome(kind, e.id, {"provider_name": draft.provider_name, "slot": draft.slot, "old_slot": draft.old_slot,
-                                "price": draft.price, "booking_id": exe.result.get("booking_id", draft.booking_id)})
+    return Outcome(exe.result["outcome"]["kind"], e.id, exe.result["outcome"]["data"])
 
 
 def for_state(store: Store, e: Errand) -> Outcome:

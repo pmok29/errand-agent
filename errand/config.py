@@ -90,6 +90,4 @@ class Settings:
     limits: Limits = field(default_factory=Limits)
     context: ContextConfig = field(default_factory=ContextConfig)
     paths: Paths = field(default_factory=Paths)
-    hold_ttl_s: int = 600
     approval_ttl_s: int = 600
-    user_id: str = "u1"

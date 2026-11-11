@@ -11,13 +11,16 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable
 
 from errand.clock import Clock, SystemClock
 from errand.tracing.cost import estimate
 
 # \w lookarounds so digit runs inside IDs and hex idempotency keys are never masked
+MAX_EVENTS_IN_MEMORY = 20_000  # the JSONL files hold the full history
+
 PHONE = re.compile(r"(?<![\w+-])(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?![\w-])")
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
@@ -35,13 +38,14 @@ def sanitize(value: Any) -> Any:
 class Tracer:
     def __init__(self, traces_dir: Path | None = None, clock: Clock | None = None):
         self.traces_dir, self.clock = traces_dir, clock or SystemClock()
-        self.events: list[dict[str, Any]] = []
+        self.events: deque[dict[str, Any]] = deque(maxlen=MAX_EVENTS_IN_MEMORY)
         self._subscribers: list[Callable[[dict], None]] = []
         self._lock = threading.Lock()
         self._seq = 0
         self.run_id: str | None = None
         self.session_id: str | None = None
         self.path: Path | None = None
+        self._file: IO[str] | None = None
         self._t0 = 0.0
         self._totals: dict[str, Any] = {}
 
@@ -52,11 +56,13 @@ class Tracer:
         self._t0 = time.perf_counter()
         self._totals = {"llm_calls": 0, "input_tokens": 0, "output_tokens": 0, "tool_calls": 0,
                         "cost_usd": 0.0, "cost_known": True}
+        self._close_file()
         self.path = None
         if self.traces_dir is not None:
             d = self.traces_dir / session_id
             d.mkdir(parents=True, exist_ok=True)
             self.path = d / f"{self.run_id}.jsonl"
+            self._file = self.path.open("a", buffering=1)  # line-buffered: each event lands immediately
         self.emit("run_start", session_id=session_id, kind=kind, **data)
         return self.run_id
 
@@ -64,7 +70,13 @@ class Tracer:
         totals = dict(self._totals, wall_ms=round((time.perf_counter() - self._t0) * 1000, 1))
         self.emit("run_end", outcome=outcome, totals=totals, **data)
         self.run_id = None
+        self._close_file()
         return totals
+
+    def _close_file(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
     # ---------- events ----------
     def emit(self, type: str, **data: Any) -> dict[str, Any]:
@@ -77,9 +89,8 @@ class Tracer:
             if type == "tool_call" and self.run_id:
                 self._totals["tool_calls"] += 1
             self.events.append(event)
-            if self.path is not None:
-                with self.path.open("a") as f:
-                    f.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
+            if self._file is not None:
+                self._file.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
         for cb in list(self._subscribers):
             try:
                 cb(event)
@@ -109,6 +120,3 @@ class Tracer:
 
     def of_type(self, type: str) -> list[dict[str, Any]]:
         return [e for e in self.events if e["type"] == type]
-
-    def run_events(self, run_id: str) -> list[dict[str, Any]]:
-        return [e for e in self.events if e["run_id"] == run_id]
