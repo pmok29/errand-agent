@@ -36,9 +36,14 @@ CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY, errand_id TEXT NOT NULL, action TEXT NOT NULL,
     attempt_no INTEGER NOT NULL, idem_key TEXT NOT NULL, payload_hash TEXT NOT NULL,
     approval_hash TEXT NOT NULL, parent_execution_id TEXT, state TEXT NOT NULL,
-    retries INTEGER NOT NULL DEFAULT 0, last_error TEXT, result_json TEXT NOT NULL DEFAULT '{}',
+    payload_json TEXT NOT NULL, retries INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+    result_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE (errand_id, action, attempt_no)
+);
+CREATE TABLE IF NOT EXISTS seen_refs (
+    errand_id TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, meta_json TEXT NOT NULL,
+    PRIMARY KEY (errand_id, kind, ref)
 );
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,

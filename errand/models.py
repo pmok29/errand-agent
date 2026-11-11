@@ -92,11 +92,17 @@ class Request(BaseModel):
     time_window: tuple[str, str] | None = None  # "HH:MM", "HH:MM"
     budget_max: int | None = None
     provider_pref: str | None = None
+    booking_id: str | None = None               # target of a reschedule / cancel
 
-    REQUIRED: ClassVar[tuple[str, ...]] = ("service", "area", "date_range")
+    REQUIRED: ClassVar[dict[str, tuple[str, ...]]] = {
+        "book": ("service", "area", "date_range"),
+        "rebook": ("service", "area", "date_range"),
+        "reschedule": ("booking_id", "date_range"),
+        "cancel": ("booking_id",),
+    }
 
-    def missing(self) -> list[str]:
-        return [f for f in self.REQUIRED if getattr(self, f) is None]
+    def missing(self, kind: str = "book") -> list[str]:
+        return [f for f in self.REQUIRED[kind] if getattr(self, f) is None]
 
 
 class Errand(BaseModel):
@@ -153,6 +159,7 @@ class Execution(BaseModel):
     payload_hash: str
     approval_hash: str
     parent_execution_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
     state: ExecState
     retries: int = 0
     last_error: str | None = None
