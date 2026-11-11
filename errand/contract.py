@@ -1,6 +1,9 @@
 """The fixed tool contract shared by the agent and the mock provider."""
 from __future__ import annotations
 
+SERVICES = ("plumber", "electrician", "ac_servicing", "cleaner")
+AREAS = ("Indiranagar", "Koramangala", "HSR Layout")
+
 # name -> required argument names (get_booking_status takes exactly one of its optional two)
 CONTRACT: dict[str, tuple[str, ...]] = {
     "search_providers": ("service", "area", "date_range"),

@@ -77,16 +77,20 @@ def code_for(hash: str) -> str:
     return base64.b32encode(bytes.fromhex(hash))[:4].decode()
 
 
-def render_card(draft: ApprovalDraft, code: str) -> dict:
+def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> dict:
+    over_budget = draft.price is not None and budget is not None and draft.price > budget
     if draft.action == Action.BOOK:
         line = f"Book {draft.provider_name} on {fmt_slot(draft.slot)} for {fmt_money(draft.price)}"
+        if over_budget:
+            line += f" (above your {fmt_money(budget)} budget)"
     elif draft.action == Action.CANCEL:
         line = f"Cancel your {draft.provider_name} booking on {fmt_slot(draft.slot)}"
     else:
         line = (f"Move your {draft.provider_name} booking from {fmt_slot(draft.old_slot)} "
                 f"to {fmt_slot(draft.slot)}")
     text = f"{line}. Reply CONFIRM {code} to go ahead, or tell me what to change."
-    return {"kind": "card", "text": text, "code": code, "draft": draft.model_dump(mode="json")}
+    return {"kind": "card", "text": text, "code": code, "draft": draft.model_dump(mode="json"),
+            "over_budget": over_budget}
 
 
 def payload_for(store: Store, errand: Errand, draft: ApprovalDraft) -> dict:
@@ -97,7 +101,8 @@ def payload_for(store: Store, errand: Errand, draft: ApprovalDraft) -> dict:
     return {"booking_id": draft.booking_id, "slot": draft.slot}
 
 
-def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, ttl_s: int) -> tuple[Approval, dict]:
+def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, ttl_s: int,
+           budget: int | None = None) -> tuple[Approval, dict]:
     invalidate_pending(store, tracer, errand, "superseded")
     expires = store.clock.now() + timedelta(seconds=ttl_s)
     if draft.action == Action.BOOK:
@@ -108,7 +113,7 @@ def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, t
     store.insert_approval(a)
     tracer.emit("approval_created", errand_id=errand.id, approval_id=a.id, hash=h, code=a.code,
                 draft=draft.model_dump(mode="json"), expires_at=a.expires_at)
-    return a, render_card(draft, a.code)
+    return a, render_card(draft, a.code, budget)
 
 
 def invalidate_pending(store: Store, tracer: Tracer, errand: Errand, reason: str) -> None:

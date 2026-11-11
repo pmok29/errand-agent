@@ -5,8 +5,10 @@ import random
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-SERVICES = {"plumber": "plb", "electrician": "ele", "ac_servicing": "acs", "cleaner": "cln"}
-AREAS = ["Indiranagar", "Koramangala", "HSR Layout"]
+from errand.contract import AREAS, SERVICES
+
+SERVICE_CODES = {"plumber": "plb", "electrician": "ele", "ac_servicing": "acs", "cleaner": "cln"}
+assert tuple(SERVICE_CODES) == SERVICES
 WORK_HOURS = list(range(8, 19))  # 08:00 .. 18:00 starts
 
 INJECTION_REVIEW = (
@@ -54,7 +56,7 @@ _REVIEW_POOL = [
 
 def _build() -> dict[str, Provider]:
     catalog: dict[str, Provider] = {}
-    for service, code in SERVICES.items():
+    for service, code in SERVICE_CODES.items():
         lo, hi = _BASE[service]
         for i, name in enumerate(_NAMES[service], start=1):
             rng = random.Random(f"provider:{code}:{i}")

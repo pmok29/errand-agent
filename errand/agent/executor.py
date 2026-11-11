@@ -188,7 +188,8 @@ class Executor:
             self._move(exe, ExecState.FAILED, S.AWAITING_APPROVAL, "price_changed_on_rehold")
             e = self.store.get_errand(exe.errand_id)
             new_draft = approvals.build_draft(self.store, e, Action.BOOK)
-            _, card = approvals.create(self.store, self.tracer, e, new_draft, self.settings.approval_ttl_s)
+            _, card = approvals.create(self.store, self.tracer, e, new_draft, self.settings.approval_ttl_s,
+                                      budget=e.request.budget_max)
             return Outcome("needs_reapproval", exe.errand_id,
                            {"old_price": draft.price, "new_price": new_draft.price}, card=card)
         # material details unchanged: continue under the same approval with a new attempt and key

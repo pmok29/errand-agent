@@ -10,7 +10,8 @@ from errand.agent.state import TOOLS_BY_STATE
 from errand.agent.store import Store, slot_ref
 from errand.config import Limits
 from errand.contract import SIDE_EFFECT_TOOLS
-from errand.models import Action, ApprovalStatus, Errand, Execution, ExecState, split_date_range
+from errand.models import (Action, ApprovalStatus, Errand, ErrandState, Execution, ExecState, Request,
+                           split_date_range)
 from errand.tracing.tracer import Tracer
 
 
@@ -18,6 +19,15 @@ from errand.tracing.tracer import Tracer
 class Decision:
     allow: bool
     reason: str = "ok"
+
+
+def slot_outside_request(req: Request, slot: str) -> str | None:
+    """Why a slot violates the recorded date range / time window, or None if it fits."""
+    if req.date_range and not (req.date_range[0] <= slot[:10] <= req.date_range[1]):
+        return f"slot {slot} is outside the requested dates {req.date_range[0]}..{req.date_range[1]}"
+    if req.time_window and not (req.time_window[0] <= slot[11:16] < req.time_window[1]):
+        return f"slot {slot} is outside the requested time window {req.time_window[0]}-{req.time_window[1]}"
+    return None
 
 
 # IDs a tool's arguments must reference: (ref kind, how to build the ref from args, denial message)
@@ -69,6 +79,8 @@ class Gate:
                 given = None
             if req.date_range is not None and given != tuple(req.date_range):
                 return Decision(False, "date_range differs from the recorded request; call update_request first")
+        elif tool == "hold_slot" and (why := slot_outside_request(e.request, args.get("slot", ""))):
+            return Decision(False, why)
         elif tool == "list_bookings" and args.get("user_id") != e.user_id:
             return Decision(False, "list_bookings is only allowed for the current user")
         elif tool == "request_approval":
@@ -78,6 +90,10 @@ class Gate:
                 return Decision(False, "action must be book, cancel or reschedule")
             if action != action_for(e.kind):
                 return Decision(False, f"this errand is a {e.kind}; it cannot request {action}")
+            if action == Action.BOOK and e.state != ErrandState.HOLDING:
+                return Decision(False, "hold the chosen slot first, then request approval")
+            if action == Action.RESCHEDULE and (why := slot_outside_request(e.request, args.get("slot") or "")):
+                return Decision(False, why)
         return Decision(True)
 
     # ---------- executor side effects ----------

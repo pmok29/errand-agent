@@ -69,6 +69,10 @@ class Store:
     def get_errand(self, errand_id: str) -> Errand:
         return self._errand(self.db.one("SELECT * FROM errands WHERE id=?", errand_id))
 
+    def latest_errand(self, session_id: str) -> Errand | None:
+        row = self.db.one("SELECT * FROM errands WHERE session_id=? ORDER BY rowid DESC LIMIT 1", session_id)
+        return self._errand(row) if row else None
+
     def active_errand(self, session_id: str) -> Errand | None:
         states = [str(s) for s in OPEN_STATES]
         row = self.db.one(f"SELECT * FROM errands WHERE session_id=? AND state IN ({_placeholders(states)}) "
@@ -97,6 +101,11 @@ class Store:
         row = self.db.one("SELECT meta_json FROM seen_refs WHERE errand_id=? AND kind=? AND ref=?",
                           errand_id, kind, ref)
         return json.loads(row["meta_json"]) if row else None
+
+    def refs(self, errand_id: str, kind: str) -> list[dict[str, Any]]:
+        rows = self.db.all("SELECT ref, meta_json FROM seen_refs WHERE errand_id=? AND kind=? ORDER BY rowid",
+                           errand_id, kind)
+        return [{"id": r["ref"], **json.loads(r["meta_json"])} for r in rows]
 
     def record_tool_refs(self, errand_id: str, tool: str, result: ToolResult) -> None:
         """Remember every ID a tool result showed us; the gate rejects IDs that never appeared."""
@@ -230,6 +239,18 @@ class Store:
         return [self._execution(r) for r in self.db.all(
             "SELECT * FROM executions WHERE state IN (?,?) ORDER BY rowid",
             ExecState.EXECUTING, ExecState.VERIFYING)]
+
+    # ---------- chat messages ----------
+    def add_message(self, session_id: str, role: str, content: str, kind: str = "chat") -> str:
+        mid = new_id("m")
+        self.db.conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
+                             (mid, session_id, role, content, kind, self._now()))
+        return mid
+
+    def session_messages(self, session_id: str, limit: int | None = None) -> list[dict[str, str]]:
+        rows = self.db.all("SELECT role, content, kind FROM messages WHERE session_id=? ORDER BY rowid DESC"
+                           + (f" LIMIT {int(limit)}" if limit else ""), session_id)
+        return [dict(r) for r in reversed(rows)]
 
     # ---------- notifications ----------
     def add_notification(self, session_id: str, payload: dict[str, Any]) -> None:
