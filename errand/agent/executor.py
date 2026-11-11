@@ -56,6 +56,19 @@ class Executor:
         """Recovery after a restart: always consult the source of truth before calling again."""
         return self._handlers[exe.action](exe, verify_first=True)
 
+    def recheck_unverified(self, exe: Execution) -> Outcome | None:
+        """Watcher follow-up for an UNVERIFIED booking. None while the provider still says pending."""
+        s = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
+        status = s.data.get("status") if (s and s.ok) else None
+        if status == "booked":
+            d = self._draft(exe)
+            return self._done(exe, "booked", {"provider_name": d.provider_name, "slot": d.slot,
+                                              "price": exe.payload["price"], "booking_id": s.data["booking_id"]},
+                              s.data["booking_id"])
+        if status == "not_booked":
+            return self._fail(exe, "the provider confirmed the booking did not go through")
+        return None
+
     # ---------- plumbing ----------
     def _fault(self, point: str) -> None:
         if point in self.faults:

@@ -83,6 +83,11 @@ class MemoryStore:
         """Rows that currently stand for `key` (usable or awaiting confirmation)."""
         return [m for m in self.all(user_id) if m.key == key and m.status in (*USABLE, St.CANDIDATE)]
 
+    def value(self, user_id: str, key: str) -> str | None:
+        """The usable (explicit or confirmed) value for `key`, if any. Candidates never count."""
+        rows = [m for m in self.current(user_id, key) if m.status in USABLE]
+        return rows[-1].value if rows else None
+
     # ---------- user operations ----------
     def visible(self, user_id: str) -> list[Memory]:
         """What the user sees on inspect: everything not forgotten or superseded."""

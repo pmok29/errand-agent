@@ -55,6 +55,15 @@ def render(o: Outcome) -> str:
             return "The details changed since that code was issued (provider, slot or price), so it no longer applies. Nothing was booked."
         case "awaiting":
             return f"Waiting for your confirmation. Reply CONFIRM {d['code']} to go ahead, or tell me what to change."
+        case "provider_cancelled":
+            return (f"Heads up: {d['provider_name']} cancelled your {d['service'].replace('_', ' ')} booking on "
+                    f"{slot}. I'm looking for a replacement that fits your preferences.")
+        case "no_replacement":
+            return ("I couldn't find a replacement within your preferences, so I haven't held or booked anything. "
+                    "Want me to look at other days, areas or prices?")
+        case "unverified_final":
+            return ("I still can't confirm whether that booking went through, so I won't rebook automatically. "
+                    "Please check with the provider, or ask me to look again.")
         case "limit":
             return ("I had to stop here because this request hit my step limit. "
                     f"Current status: {d.get('status', 'nothing has been booked')}. You can rephrase or try again.")

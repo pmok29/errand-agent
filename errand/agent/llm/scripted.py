@@ -16,6 +16,7 @@ from errand.agent.llm.base import LLMResponse, ToolCall, estimate_tokens
 from errand.contract import AREAS
 
 STATE_RE = re.compile(r"<state>(.*)</state>", re.S)
+NOTICE = "[Automated notice"   # system-started run: no user to ask, pick the best fit
 TOOL_RE = re.compile(r"<tool_output[^>]*>(.*)</tool_output>", re.S)
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 SERVICE_WORDS = [(r"plumb|\btap\b|leak|pipe|drain", "plumber"), (r"electric|wiring|switch|\bfan\b", "electrician"),
@@ -157,6 +158,10 @@ class ReactivePolicy:
             err = obs.last_result.get("error") or {}
             return f"Sorry, that didn't work ({err.get('message') or err.get('code', 'error')})."
 
+        if obs.user.startswith(NOTICE):
+            if s["missing"]:
+                return " ".join(ASK.get(f, f"What is the {f}?") for f in s["missing"])
+            return self._book(obs, tools, done_names, auto_pick=True)
         known = [m["key"] for m in s.get("memories", [])]
         if (cmd := parse_memory_command(obs.user, known)) and "memory_op" in tools:
             if "memory_op" not in done_names:
@@ -191,13 +196,14 @@ class ReactivePolicy:
             return f"I've forgotten your {cmd['key'].replace('_', ' ')}."
         return f"Got it, I'll use {cmd['value']} from now on."
 
-    def _book(self, obs: Observation, tools: set[str], done_names: list[str]) -> str | tuple[str, dict]:
+    def _book(self, obs: Observation, tools: set[str], done_names: list[str],
+              auto_pick: bool = False) -> str | tuple[str, dict]:
         s = obs.state
         options = s["options"]
         viable = [o for o in options if o["within_budget"] and o["slots"]]
         if s["errand"]["state"] == "HOLDING" and s["hold"] and "hold_slot" in done_names:
             return ("request_approval", {"action": "book"})
-        choice = parse_choice(obs.user)
+        choice = 0 if auto_pick and "search_providers" in done_names else parse_choice(obs.user)
         if choice is not None and viable and "hold_slot" in tools and "hold_slot" not in done_names:
             pick = viable[min(choice, len(viable) - 1)]
             return ("hold_slot", {"provider_id": pick["provider_id"], "slot": pick["slots"][0]})

@@ -69,6 +69,18 @@ class Store:
     def get_errand(self, errand_id: str) -> Errand:
         return self._errand(self.db.one("SELECT * FROM errands WHERE id=?", errand_id))
 
+    def users(self) -> list[str]:
+        return [r["user_id"] for r in self.db.all("SELECT DISTINCT user_id FROM sessions ORDER BY user_id")]
+
+    def latest_session(self, user_id: str) -> str | None:
+        row = self.db.one("SELECT id FROM sessions WHERE user_id=? ORDER BY rowid DESC LIMIT 1", user_id)
+        return row["id"] if row else None
+
+    def rebook_exists(self, user_id: str, booking_id: str) -> bool:
+        rows = self.db.all("SELECT request_json FROM errands WHERE user_id=? AND kind='rebook' AND state<>'FAILED'",
+                           user_id)
+        return any(Request.model_validate_json(r["request_json"]).booking_id == booking_id for r in rows)
+
     def latest_errand(self, session_id: str) -> Errand | None:
         row = self.db.one("SELECT * FROM errands WHERE session_id=? ORDER BY rowid DESC LIMIT 1", session_id)
         return self._errand(row) if row else None
@@ -235,6 +247,9 @@ class Store:
                           errand_id, action)
         return (row["n"] or 0) + 1
 
+    def executions_in(self, state: ExecState) -> list[Execution]:
+        return [self._execution(r) for r in self.db.all("SELECT * FROM executions WHERE state=? ORDER BY rowid", state)]
+
     def open_executions(self) -> list[Execution]:
         return [self._execution(r) for r in self.db.all(
             "SELECT * FROM executions WHERE state IN (?,?) ORDER BY rowid",
@@ -251,6 +266,35 @@ class Store:
         rows = self.db.all("SELECT role, content, kind FROM messages WHERE session_id=? ORDER BY rowid DESC"
                            + (f" LIMIT {int(limit)}" if limit else ""), session_id)
         return [dict(r) for r in reversed(rows)]
+
+    # ---------- watcher bookkeeping ----------
+    def snapshot(self, booking_id: str) -> str | None:
+        row = self.db.one("SELECT status FROM booking_snapshots WHERE booking_id=?", booking_id)
+        return row["status"] if row else None
+
+    def has_snapshots(self) -> bool:
+        return self.db.one("SELECT 1 FROM booking_snapshots LIMIT 1") is not None
+
+    def set_snapshot(self, booking_id: str, status: str) -> None:
+        self.db.conn.execute("INSERT INTO booking_snapshots VALUES (?,?,?) ON CONFLICT(booking_id) DO UPDATE SET "
+                             "status=excluded.status, seen_at=excluded.seen_at", (booking_id, status, self._now()))
+
+    def job(self, kind: str, errand_id: str) -> dict | None:
+        row = self.db.one("SELECT * FROM watcher_jobs WHERE kind=? AND errand_id=?", kind, errand_id)
+        return dict(row) if row else None
+
+    def add_job(self, kind: str, errand_id: str, next_run_at: str, max_attempts: int) -> dict:
+        jid = new_id("j")
+        self.db.conn.execute("INSERT INTO watcher_jobs VALUES (?,?,?,?,0,?,'open')",
+                             (jid, kind, errand_id, next_run_at, max_attempts))
+        return self.job(kind, errand_id)
+
+    def update_job(self, job_id: str, **fields) -> None:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.conn.execute(f"UPDATE watcher_jobs SET {sets} WHERE id=?", (*fields.values(), job_id))
+
+    def pending_approvals(self) -> list[Approval]:
+        return [self._approval(r) for r in self.db.all("SELECT * FROM approvals WHERE status=?", ApprovalStatus.PENDING)]
 
     # ---------- notifications ----------
     def add_notification(self, session_id: str, payload: dict[str, Any]) -> None:

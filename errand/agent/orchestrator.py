@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from datetime import timedelta
 from typing import Any, Callable
@@ -55,6 +56,8 @@ class Agent:
         self.memory = MemoryStore(store)
         self.gate = Gate(store, tracer, self.limits)
         self.executor = Executor(store, self.gate, tracer, clock, call, self.settings, faults)
+        # one conversation step at a time: the web app's request threads and the watcher share the agent
+        self.lock = threading.RLock()
 
     # ---------- public ----------
     def new_session(self, user_id: str = "u1") -> str:
@@ -64,6 +67,19 @@ class Agent:
         return recover(self.executor, self.tracer)
 
     def handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._handle_user_message(session_id, text)
+
+    def run_proactive(self, e: Errand, notice: str) -> list[dict[str, Any]]:
+        """An LLM run started by the system (no user message). The notice is code-authored and marked as such."""
+        self.store.add_message(e.session_id, "user", f"[Automated notice, not from the user] {notice}", kind="event")
+        try:
+            return self._llm_loop(e)
+        except Exception as err:
+            self.tracer.emit("error", error=repr(err))
+            return [self._reply(e.session_id, "template", INTERNAL_ERROR)]
+
+    def _handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
         self.tracer.start_run(session_id, kind="user_message")
         self.tracer.emit("user_msg", text=text)
         self.store.add_message(session_id, "user", text)
