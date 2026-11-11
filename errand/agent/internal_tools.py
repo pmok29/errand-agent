@@ -1,13 +1,15 @@
-"""Internal tools the LLM calls to record the request and to ask for approval."""
+"""Internal tools the LLM calls: record the request, ask for approval, and manage memory."""
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any
 
 from errand.agent import approvals
+from errand.agent.memory import MemoryStore
 from errand.agent.state import transition
 from errand.agent.store import Store
-from errand.models import Errand, ErrandKind, ErrandState as S, ToolResult
+from errand.models import Errand, ErrandKind, ErrandState as S, MemorySource, MemoryStatus, ToolResult
 from errand.tracing.tracer import Tracer
 
 MATERIAL = ("service", "area", "date_range", "time_window", "budget_max", "provider_pref", "booking_id")
@@ -76,3 +78,45 @@ def request_approval(store: Store, tracer: Tracer, e: Errand, args: dict[str, An
     _, card = approvals.create(store, tracer, e, draft, ttl_s, budget=e.request.budget_max)
     transition(store, tracer, e, S.AWAITING_APPROVAL, "approval_requested")
     return ToolResult.success(status="shown_to_user", code=card["code"]), card
+
+
+def _key(raw: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+
+
+def propose_memory(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+    key, value, explicit = _key(args.get("key", "")), str(args.get("value", "")).strip(), bool(args.get("explicit"))
+    if not key or not value:
+        return ToolResult.fail("invalid_arguments", message="key and value are required")
+    evidence = mem.stated_by_user(e.session_id, value)
+    if evidence is None:  # provenance: only what the user said may become a memory
+        tracer.emit("memory_rejected", errand_id=e.id, key=key, reason="not_stated_by_user")
+        return ToolResult.fail("not_stated_by_user", message="only facts the user stated in this conversation can be remembered")
+    scope = args.get("scope") or "global"
+    if explicit:
+        m = mem.correct(e.user_id, key, value, scope, evidence, e.session_id)
+    elif any(c.value == value for c in mem.current(e.user_id, key)):
+        return ToolResult.success(status="already_known", key=key)
+    else:
+        m = mem.add(e.user_id, key, value, MemorySource.INFERRED, MemoryStatus.CANDIDATE, scope, evidence, e.session_id)
+    tracer.emit("memory_write", errand_id=e.id, key=key, value=value, source=m.source, status=m.status)
+    return ToolResult.success(status=m.status, key=key, source=m.source)
+
+
+def memory_op(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+    op = args.get("op")
+    if op == "list":
+        return ToolResult.success(memories=[{"key": m.key, "value": m.value, "source": m.source, "status": m.status}
+                                            for m in mem.visible(e.user_id)])
+    key = _key(args.get("key", ""))
+    if op == "forget":
+        gone = mem.forget(e.user_id, key)
+        if not gone:
+            return ToolResult.fail("not_found", message=f"no memory '{key}'; known keys: "
+                                   + ", ".join(sorted({m.key for m in mem.visible(e.user_id)})))
+        tracer.emit("memory_forgotten", errand_id=e.id, key=key, count=len(gone))
+        return ToolResult.success(status="forgotten", key=key)
+    if op == "correct":
+        return propose_memory(mem, tracer, e, {"key": key, "value": args.get("value", ""), "explicit": True,
+                                               "scope": args.get("scope")})
+    return ToolResult.fail("invalid_arguments", message="op must be list, correct or forget")

@@ -69,6 +69,34 @@ def parse_request(text: str, today: date) -> dict[str, Any]:
     return f
 
 
+MEMORY_KEYS = {"area": "preferred_area", "earliest time": "earliest_time"}
+
+
+def _memory_key(phrase: str, known: list[str]) -> str:
+    phrase = phrase.strip().lower()
+    if phrase in MEMORY_KEYS:
+        return MEMORY_KEYS[phrase]
+    words = set(re.findall(r"[a-z]+", phrase))
+    best = max(known, key=lambda k: len(words & set(k.split("_"))), default=None)
+    if best and words & set(best.split("_")):
+        return best
+    return re.sub(r"[^a-z0-9]+", "_", phrase).strip("_")
+
+
+def parse_memory_command(text: str, known: list[str]) -> tuple[str, dict] | None:
+    t = text.lower().strip()
+    if re.search(r"what do you (know|remember)|show (me )?(my |your )?memor", t):
+        return ("memory_op", {"op": "list"})
+    if m := re.search(r"\bforget (?:about )?(?:my |the )?(.+?)[.!]?$", t):
+        return ("memory_op", {"op": "forget", "key": _memory_key(m.group(1), known)})
+    if m := re.search(r"\bmy (.+?) is (?:now )?(.+?)(?: now)?(?:,? (?:please )?remember (?:it|that))?[.!]?$", text, re.I):
+        key = _memory_key(m.group(1), known)
+        # "my kitchen tap is leaking" is a request, not a preference
+        if " now" in t or "remember" in t or key in known:
+            return ("memory_op", {"op": "correct", "key": key, "value": m.group(2).strip()})
+    return None
+
+
 def parse_choice(text: str) -> int | None:
     t = text.lower()
     if m := re.search(r"\b(?:option|number|no\.?|#)\s*(\d)\b", t):
@@ -129,15 +157,39 @@ class ReactivePolicy:
             err = obs.last_result.get("error") or {}
             return f"Sorry, that didn't work ({err.get('message') or err.get('code', 'error')})."
 
+        known = [m["key"] for m in s.get("memories", [])]
+        if (cmd := parse_memory_command(obs.user, known)) and "memory_op" in tools:
+            if "memory_op" not in done_names:
+                return cmd
+            return self._memory_reply(cmd[1], obs.last_result or {})
+
         today = datetime.strptime(s["now"][:10], "%Y-%m-%d").date()
         fields = parse_request(obs.user, today)
+        remembered = {m["key"]: m["value"] for m in s.get("memories", [])}
+        if "area" in s["missing"] and "area" not in fields and remembered.get("preferred_area"):
+            fields["area"] = remembered["preferred_area"]  # fill from memory rather than asking
         if fields and "update_request" in tools and "update_request" not in done_names:
             return ("update_request", fields)
+        if (m := re.search(r"not before (\d{1,2})\s*([ap]\.?m\.?)?", obs.user.lower())) \
+                and "propose_memory" in tools and "propose_memory" not in done_names:
+            # a time limit stated for this request might be a standing preference: an inference to confirm later
+            return ("propose_memory", {"key": "earliest_time", "value": _hour(m.group(1), m.group(2)), "explicit": False})
         if s["missing"]:
             return " ".join(ASK.get(f, f"What is the {f}?") for f in s["missing"])
         if s["errand"]["kind"] in ("book", "rebook"):
             return self._book(obs, tools, done_names)
         return "Rescheduling and cancelling are handled in a later build of this policy."
+
+    @staticmethod
+    def _memory_reply(cmd: dict, result: dict) -> str:
+        data = result.get("data", {})
+        if cmd["op"] == "list":
+            items = data.get("memories", [])
+            return "Here's what I remember: " + "; ".join(
+                f"{m['key'].replace('_', ' ')}: {m['value']} ({m['source']})" for m in items) if items else "I don't remember anything about you yet."
+        if cmd["op"] == "forget":
+            return f"I've forgotten your {cmd['key'].replace('_', ' ')}."
+        return f"Got it, I'll use {cmd['value']} from now on."
 
     def _book(self, obs: Observation, tools: set[str], done_names: list[str]) -> str | tuple[str, dict]:
         s = obs.state

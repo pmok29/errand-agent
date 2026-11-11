@@ -188,4 +188,6 @@ class Memory(BaseModel):
     source: MemorySource
     status: MemoryStatus
     evidence_msg_id: str | None = None
+    evidence_session_id: str | None = None
     superseded_by: str | None = None
+    prompted: bool = False

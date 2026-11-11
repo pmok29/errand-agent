@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import timedelta
 from typing import Any, Callable
@@ -9,7 +10,8 @@ from typing import Any, Callable
 from errand.agent import approvals, claim_guard, context, internal_tools, sanitize
 from errand.agent.executor import Executor
 from errand.agent.gate import Gate, slot_outside_request
-from errand.agent.llm.base import LLMClient, LLMError, ToolCall, estimate_tokens
+from errand.agent.llm.base import LLMClient, LLMError, ToolCall
+from errand.agent.memory import MemoryStore
 from errand.agent.recovery import recover
 from errand.agent.state import transition
 from errand.agent.store import Store
@@ -22,6 +24,8 @@ from errand.tracing.tracer import Tracer
 
 ToolCallFn = Callable[[str, dict], ToolResult]
 LIMIT_STATES = {S.GATHERING, S.COMPARING, S.HOLDING}
+SUCCESS = {"booked", "cancelled", "rescheduled"}
+REMEMBER_RE = re.compile(r"\s*remember\s+(yes|no)\s*[.!]?\s*", re.I)
 MAX_SLOTS_SHOWN = 6
 
 LLM_UNAVAILABLE = ("I'm having trouble reaching my language model right now. Nothing was booked or changed; "
@@ -48,6 +52,7 @@ class Agent:
         self.store, self.call, self.llm, self.tracer, self.clock = store, call, llm, tracer, clock
         self.settings = settings or Settings()
         self.limits = self.settings.limits
+        self.memory = MemoryStore(store)
         self.gate = Gate(store, tracer, self.limits)
         self.executor = Executor(store, self.gate, tracer, clock, call, self.settings, faults)
 
@@ -73,6 +78,8 @@ class Agent:
 
     # ---------- routing ----------
     def _handle(self, session_id: str, text: str) -> list[dict[str, Any]]:
+        if m := REMEMBER_RE.fullmatch(text):
+            return self._answer_memory_prompt(session_id, m.group(1).lower() == "yes")
         if (code := approvals.match_code(text)) is not None:
             e = self.store.latest_errand(session_id)
             if e is None:
@@ -115,9 +122,8 @@ class Agent:
             if self.clock.now() >= deadline:
                 return self._limit(e, "wall_clock")
 
-            ctx = context.build(self.store, e, turn)
-            self.tracer.emit("context_sent", errand_id=e.id, messages=ctx.messages, state=ctx.state,
-                             est_tokens=estimate_tokens(json.dumps(ctx.messages, ensure_ascii=False)))
+            ctx = context.build(self.store, self.memory, e, turn, self.settings.context)
+            self.tracer.emit("context_sent", errand_id=e.id, messages=ctx.messages, **ctx.meta)
             try:
                 resp = self.llm.complete(ctx.messages, schemas_for(e.state))
             except LLMError as err:
@@ -168,6 +174,10 @@ class Agent:
             return internal_tools.update_request(self.store, self.tracer, e, args), None
         if name == "request_approval":
             return internal_tools.request_approval(self.store, self.tracer, e, args, self.settings.approval_ttl_s)
+        if name == "propose_memory":
+            return internal_tools.propose_memory(self.memory, self.tracer, e, args), None
+        if name == "memory_op":
+            return internal_tools.memory_op(self.memory, self.tracer, e, args), None
         try:
             result = self.call(name, args)
         except ToolTimeout:
@@ -219,7 +229,23 @@ class Agent:
         out = [self._reply(e.session_id, "template", render(o))]
         if o.card:
             out.append(self._reply(e.session_id, "card", o.card["text"], o.card))
+        if o.kind in SUCCESS and (m := self.memory.next_prompt(e.user_id, e.session_id)):
+            self.memory.mark_prompted(m.id)  # ask once, after the errand, about one inferred preference
+            out.append(self._reply(e.session_id, "memory_prompt",
+                                   f'Should I remember "{m.key.replace("_", " ")}: {m.value}" for future requests? '
+                                   'Reply "remember yes" or "remember no".', {"memory_id": m.id}))
         return out
+
+    def _answer_memory_prompt(self, session_id: str, accept: bool) -> list[dict[str, Any]]:
+        user = self.store.session_user(session_id)
+        m = self.memory.last_prompted(user, session_id)
+        if m is None:
+            return [self._reply(session_id, "template", "There's nothing waiting for a yes or no.")]
+        self.memory.confirm(m.id, accept)
+        self.tracer.emit("memory_confirmed" if accept else "memory_rejected", key=m.key, value=m.value)
+        text = (f'Saved: "{m.key.replace("_", " ")}: {m.value}".' if accept
+                else f'Okay, I won\'t remember "{m.key.replace("_", " ")}".')
+        return [self._reply(session_id, "template", text)]
 
     def _limit(self, e: Errand, which: str) -> list[dict[str, Any]]:
         self.tracer.emit("limit_hit", errand_id=e.id, limit=which, state=e.state)

@@ -47,6 +47,20 @@ SCHEMAS: dict[str, dict] = {
          "slot": {"type": "string", "description": "new slot, for reschedule"},
          "booking_id": {"type": "string", "description": "for cancel / reschedule"}},
         ["action"]),
+    "propose_memory": _fn(
+        "propose_memory", "Remember a stable preference the USER stated (e.g. preferred area, earliest time, "
+        "a technician they like). explicit=true only if the user asked you to remember it or stated it as a "
+        "standing preference; otherwise it is an inference the user must confirm later.",
+        {"key": {"type": "string", "description": "snake_case, e.g. preferred_area"},
+         "value": {"type": "string", "description": "in the user's words"},
+         "explicit": {"type": "boolean"},
+         "scope": {"type": "string", "description": "global, or service:<service>"}},
+        ["key", "value", "explicit"]),
+    "memory_op": _fn(
+        "memory_op", "Show the user what you remember (list), correct a stored fact (correct), or forget one (forget).",
+        {"op": {"type": "string", "enum": ["list", "correct", "forget"]}, "key": {"type": "string"},
+         "value": {"type": "string"}},
+        ["op"]),
 }
 
 

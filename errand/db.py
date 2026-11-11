@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS seen_refs (
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'global', source TEXT NOT NULL, status TEXT NOT NULL,
-    evidence_msg_id TEXT, superseded_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    evidence_msg_id TEXT, evidence_session_id TEXT, superseded_by TEXT, prompted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS redactions (
     user_id TEXT NOT NULL, value TEXT NOT NULL, variants_json TEXT NOT NULL,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, payload_json TEXT NOT NULL,
     delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_memories_user ON memories (user_id, status);
 CREATE INDEX IF NOT EXISTS ix_errands_session ON errands (session_id, state);
 CREATE INDEX IF NOT EXISTS ix_holds_errand ON holds (errand_id);
 CREATE INDEX IF NOT EXISTS ix_approvals_errand ON approvals (errand_id, code);
