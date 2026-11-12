@@ -132,6 +132,7 @@ function summarize(e) {
     case "memory_forgotten": return [`${e.key} (${e.count})${e.by ? " via " + e.by : ""}`, "warn"];
     case "limit_hit": return [`${e.limit} in ${e.state}`, "bad"];
     case "error": case "llm_error": return [short(e.error, 140), "bad"];
+    case "llm_fallback": return [short(e.message, 140), "warn"];
     case "assistant_msg": return [`${e.kind}: ${short(e.text, 120)}`, ""];
     case "demo": return [`${e.action} ${short(fields(e, ["action"]), 100)}`, "info"];
     default: return [short(fields(e), 140), ""];

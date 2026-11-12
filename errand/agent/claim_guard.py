@@ -8,8 +8,10 @@ from errand.models import ErrandState
 _DONE = r"(booked|cancel+ed|rescheduled|confirmed|moved)"
 # First-person or passive claims of a completed side effect. Plain history ("you booked Suresh
 # last time") is deliberately not matched.
+# A bare ✅ is not a claim (models use it as a checkmark, e.g. a "verified" table column); next to a
+# done-word it is ("✅ Booked", "booked ✅").
 CLAIM = re.compile(
-    r"✅|^\s*" + _DONE + r"\b|"
+    r"✅\s*(" + _DONE + r"|done)\b|\b(" + _DONE + r"|done)\W{0,3}✅|^\s*" + _DONE + r"\b|"
     r"\b(i'?ve|i have|i)\s+(just\s+|successfully\s+)?" + _DONE + r"\b|"
     r"(\b(is|are|has been|have been|was|been|now)|'s)\s+(successfully\s+)?" + _DONE + r"\b|"
     r"\bbooking (is )?confirmed\b|\bsuccessfully " + _DONE + r"\b|"
@@ -18,7 +20,7 @@ CLAIM = re.compile(
 # "after/before/when/once/until" hedge only when a clause follows ("after you confirm"), not a time
 # ("confirmed for after 10am" is still a claim).
 HEDGE = re.compile(
-    r"\b(not|n't|never|no longer|yet|will|would|shall|should|if|can|could|"
+    r"\b(not|n't|never|nothing|no longer|yet|will|would|shall|should|if|can|could|"
     r"want|like me|to be|pending|waiting|haven'?t|hasn'?t)\b|"
     r"\b(once|after|before|when|until)\b(?!\s+(\d|noon|midday|midnight|lunch))|\?", re.I)
 SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")

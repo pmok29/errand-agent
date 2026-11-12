@@ -33,7 +33,9 @@ SCHEMAS: dict[str, dict] = {
     "update_request": _fn(
         "update_request", "Record details the USER stated (only those). Corrections overwrite just the named "
         "fields. Returns what is still missing.",
-        {"kind": {"type": "string", "enum": ["book", "reschedule", "cancel"]},
+        {"kind": {"type": "string", "enum": ["book", "reschedule", "cancel"],
+                  "description": "every errand starts as book; set reschedule or cancel first when the user "
+                                 "wants to change or cancel an existing booking"},
          "service": {"type": "string", "enum": list(SERVICES)}, "area": {"type": "string", "enum": list(AREAS)},
          "date_from": DATE, "date_to": DATE, "time_from": TIME, "time_to": TIME,
          "budget_max": {"type": "integer", "description": "rupees"},

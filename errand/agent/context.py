@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,17 @@ class Context:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+def calendar(today: date) -> dict[str, Any]:
+    """Resolved relative dates, so the model never has to do calendar arithmetic."""
+    sunday = today + timedelta(days=6 - today.weekday())
+    nxt = {(today + timedelta(days=i)).strftime("%a"): (today + timedelta(days=i)).isoformat() for i in range(1, 8)}
+    return {"today": f"{today.isoformat()} {today.strftime('%a')}",
+            "tomorrow": (today + timedelta(days=1)).isoformat(),
+            "this_week": [today.isoformat(), sunday.isoformat()],
+            "next_week": [(sunday + timedelta(days=1)).isoformat(), (sunday + timedelta(days=7)).isoformat()],
+            "next": nxt}
+
+
 def memory_view(m: Memory) -> dict[str, str]:
     """A memory as the model (and the context_sent trace) sees it."""
     return {"key": m.key, "value": m.value, "source": m.source}
@@ -43,6 +55,7 @@ def state_block(store: Store, e: Errand, memories: list[Memory]) -> dict[str, An
     hold = store.latest_hold(e.id)
     return {
         "now": now.strftime("%Y-%m-%d %a %H:%M"),
+        "dates": calendar(now.date()),
         "user_id": e.user_id,
         "errand": {"kind": e.kind, "state": e.state},
         "request": e.request.model_dump(mode="json", exclude_none=True),
@@ -71,7 +84,8 @@ def _tokens(messages: list[dict[str, Any]]) -> int:
 
 
 def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
-          cfg: ContextConfig | None = None) -> Context:
+          cfg: ContextConfig | None = None, tools: list[dict[str, Any]] | None = None) -> Context:
+    """`tools` are the schemas sent with the request: they count against the same budget."""
     cfg = cfg or ContextConfig()
     sel = mem.select(e.user_id, e.request.service, cfg.max_memories)
     scrub = _scrubber(mem.redaction_values(e.user_id))
@@ -88,6 +102,8 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
     for m in store.session_messages(e.session_id, limit=HISTORY_MAX):
         text, n = scrub(m["content"])
         hits += n
+        if m["role"] == "assistant" and m["kind"] != "chat":  # code-written: label it so models don't imitate it
+            text = f"[{m['kind']} from the system] {text}"
         history.append({"role": "assistant" if m["role"] == "assistant" else "user", "content": text})
     current, older = history[-1:], history[:-1]   # the latest user message is always kept
     turn = [dict(t) for t in turn]
@@ -95,7 +111,7 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
     # Must-keep parts first; shrink memories, then old tool outputs, if even those don't fit.
     # Token counts are taken once per message and updated only for what changes.
     system = system_message()
-    sizes = {"system": _tokens([system]), "current": _tokens(current)}
+    sizes = {"tools": _tokens(tools or []), "system": _tokens([system]), "current": _tokens(current)}
     turn_sizes = [_tokens([t]) for t in turn]
     trimmed, dropped_memories = 0, []
     while sum(sizes.values()) + sum(turn_sizes) > cfg.budget_tokens:
@@ -119,7 +135,7 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
 
     messages = [system, *kept, *current, *turn]
     excluded = [(m, r) for m, r in sel.excluded] + [(m, "budget") for m in dropped_memories]
-    meta = {"est_tokens": used, "budget": cfg.budget_tokens,
+    meta = {"est_tokens": used, "budget": cfg.budget_tokens, "tool_schema_tokens": sizes["tools"],
             "memories_included": [memory_view(m) for m in memories],
             "memories_excluded": [{"key": m.key, "status": m.status, "reason": r} for m, r in excluded],
             "history_kept": len(kept) + len(current), "history_dropped": len(older) - len(kept),

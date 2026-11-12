@@ -15,13 +15,16 @@ from errand.tracing.tracer import Tracer
 MATERIAL = ("service", "area", "date_range", "time_window", "budget_max", "provider_pref", "booking_id")
 
 
-def _pair(args: dict, a: str, b: str, current: tuple | None, label: str) -> tuple | None:
+def _pair(args: dict, a: str, b: str, current: tuple | None, label: str,
+          open_ends: tuple[str, str] | None = None) -> tuple | None:
+    """Merge a (from, to) pair. With only one end given: `open_ends` fills the other ("not before 10:00"
+    is 10:00 to end of day); without it, the range is that single value (one date)."""
     lo, hi = args.get(a), args.get(b)
     if lo is None and hi is None:
         return current
     if current:
         lo, hi = lo or current[0], hi or current[1]
-    lo, hi = lo or hi, hi or lo  # one end given: a single day / instant
+    lo, hi = (lo or open_ends[0], hi or open_ends[1]) if open_ends else (lo or hi, hi or lo)
     if hi < lo:
         raise ValueError(f"{label}: {b} is before {a}")
     return (lo, hi)
@@ -44,7 +47,7 @@ def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]
                 date.fromisoformat(d)
             if req.date_range[1] < store.clock.now().date().isoformat():
                 raise ValueError("those dates are in the past")
-        req.time_window = _pair(args, "time_from", "time_to", req.time_window, "time window")
+        req.time_window = _pair(args, "time_from", "time_to", req.time_window, "time window", ("00:00", "23:59"))
     except ValueError as err:
         return ToolResult.fail("invalid_request", message=str(err))
 
@@ -64,8 +67,10 @@ def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]
     if changed:
         e.selected.pop("options", None)
         store.save_errand(e)
+    hint = {"next_step": "call list_bookings and pick the matching booking; don't ask the user for an ID"} \
+        if "booking_id" in missing else {}
     return ToolResult.success(request=req.model_dump(mode="json"), missing=missing, already_asked=e.asked,
-                              state=e.state, changed=changed)
+                              state=e.state, changed=changed, **hint)
 
 
 def request_approval(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any], ttl_s: int) -> tuple[ToolResult, dict | None]:

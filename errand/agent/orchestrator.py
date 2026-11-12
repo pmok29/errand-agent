@@ -43,7 +43,8 @@ def compact_options(providers: list[dict], req: Request) -> list[dict]:
                     "jobs_done": p.get("jobs_done"), "verified": attrs.get("verified"),
                     "warranty_days": attrs.get("warranty_days"),
                     "within_budget": req.budget_max is None or p["price"] <= req.budget_max,
-                    "slots": [s for s in p["slots"] if not slot_outside_request(req, s)][:MAX_SLOTS_SHOWN]})
+                    "slots": (slots := [s for s in p["slots"] if not slot_outside_request(req, s)][:MAX_SLOTS_SHOWN]),
+                    "earliest": slots[0] if slots else None})
     return out
 
 
@@ -150,10 +151,11 @@ class Agent:
             if self.clock.now() >= deadline:
                 return self._limit(e, "wall_clock")
 
-            ctx = context.build(self.store, self.memory, e, turn, self.settings.context)
+            tools = schemas_for(e.state)
+            ctx = context.build(self.store, self.memory, e, turn, self.settings.context, tools)
             self.tracer.emit("context_sent", errand_id=e.id, messages=ctx.messages, **ctx.meta)
             try:
-                resp = self.llm.complete(ctx.messages, schemas_for(e.state))
+                resp = self.llm.complete(ctx.messages, tools)
             except LLMError as err:
                 self.tracer.emit("llm_error", error=str(err), retryable=err.retryable)
                 return [self.reply(e.session_id, "template", LLM_UNAVAILABLE)]
@@ -213,11 +215,14 @@ class Agent:
         self.store.record_tool_refs(e.id, name, result)
         if not result.ok:
             return result, None
+        if name == "list_bookings":  # same as search: the bookings live in STATE.bookings from now on
+            return ToolResult.success(found=len(result.data["bookings"]), see="STATE.bookings"), None
         if name == "search_providers":
             options = compact_options(result.data["providers"], e.request)
             e.selected["options"] = options
             self.store.save_errand(e)
-            return ToolResult.success(providers=options), None
+            # the options live in STATE.options from now on; repeating them here would double the tokens
+            return ToolResult.success(found=len(options), see="STATE.options"), None
         if name == "hold_slot":
             prov = self.store.ref(e.id, "provider", args["provider_id"]) or {}
             hold = self.store.record_hold(e.id, args["provider_id"], args["slot"], result, prov.get("price"))
@@ -282,4 +287,4 @@ class Agent:
         status = render(for_state(self.store, e))
         if e.state in LIMIT_STATES:
             transition(self.store, self.tracer, e, S.ABORTED_LIMIT, f"limit:{which}")
-        return self._outcome(e, Outcome("limit", e.id, {"status": status}))
+        return self._outcome(e, Outcome("limit", e.id, {"status": status, "limit": which}))

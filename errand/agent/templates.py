@@ -65,8 +65,10 @@ def render(o: Outcome) -> str:
             return ("I still can't confirm whether that booking went through, so I won't rebook automatically. "
                     "Please check with the provider, or ask me to look again.")
         case "limit":
-            return ("I had to stop here because this request hit my step limit. "
-                    f"Current status: {d.get('status', 'nothing has been booked')}. You can rephrase or try again.")
+            which = "time limit" if d.get("limit") == "wall_clock" else "step limit"
+            status = d.get("status", "Nothing has been booked or changed yet.").rstrip(".")
+            return (f"I had to stop here because this request hit my {which}. "
+                    f"Current status: {status}. You can rephrase or try again.")
         case "nothing_yet":
             return "Nothing has been booked or changed yet."
     return d.get("text", "")

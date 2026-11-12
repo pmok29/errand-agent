@@ -13,7 +13,7 @@ REQUEST = "Plumber in Indiranagar this week, mornings, under 1500"
 def web(tmp_path):
     published = []
     app = create_app(lambda publish: Runtime(tmp_path / "data", None, lambda m: (published.append(m), publish(m)),
-                                             llm_factory=lambda: (ReactivePolicy(), "scripted (offline)")),
+                                             llm_factory=lambda on_switch: (ReactivePolicy(), "scripted (offline)")),
                      watch=False)
     with TestClient(app) as client:
         client.post("/api/demo/reset", json={"preset": "timeout_booked", "seed": False})

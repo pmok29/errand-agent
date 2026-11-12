@@ -169,7 +169,7 @@ def test_side_effect_with_wrong_key_or_payload_is_denied(world_factory):
 
 # ---------- claim guard ----------
 @pytest.mark.parametrize("text", [
-    "Booked ✅", "Booked! See you Thursday.", "I've booked QuickFix for Thursday 9am.",
+    "Booked ✅", "✅ Booked for Thursday 9am", "Your plumber: done ✅", "Booked! See you Thursday.", "I've booked QuickFix for Thursday 9am.",
     "Your plumber is booked for Thursday.", "Your booking is confirmed.", "I have cancelled your booking.",
     "Your AC service has been rescheduled to Saturday.", "You're all set for Thursday.",
     "Done! I successfully booked it.", "The appointment was moved to Saturday.",
@@ -187,6 +187,21 @@ def test_claims_are_detected(text):
     "It will be confirmed after you reply with the code.", "You booked Suresh Electricals last time.",
     "Here are three plumbers available this week.", "Do you want me to cancel the Thursday booking?",
     "I can reschedule it to Saturday if you like.", "The booking is not confirmed until the provider replies.",
+    "| QuickFix Plumbing | ₹1,150 | 4.9 | ✅ |", "Nothing was booked or changed; please try again in a moment.", "Verified ✅, 7-day warranty, earliest slot 10:00.",
 ])
 def test_non_claims_pass(text):
     assert not claim_guard.claims_outcome(text)
+
+
+def test_no_status_template_reads_as_a_success_claim():
+    """Bug #7: our own "Nothing was booked or changed" message tripped the claim guard when a model echoed it."""
+    from errand.agent.orchestrator import INTERNAL_ERROR, LLM_UNAVAILABLE
+    from errand.agent.templates import Outcome, render
+    data = {"slot": "2026-11-14T15:00", "old_slot": "2026-11-11T11:00", "provider_name": "X", "service": "cleaner",
+            "price": 700, "old_price": 700, "new_price": 900, "code": "ABCD", "booking_id": "b-1",
+            "reason": "slot_taken", "status": "Nothing has been booked or changed yet."}
+    kinds = ["slot_taken", "slot_conflict", "slot_unavailable", "needs_reapproval", "unverified", "failed",
+             "cancel_failed", "approval_expired", "approval_changed", "awaiting", "provider_cancelled",
+             "no_replacement", "unverified_final", "limit", "nothing_yet", "already_processing"]
+    texts = [render(Outcome(k, "e", data)) for k in kinds] + [LLM_UNAVAILABLE, INTERNAL_ERROR]
+    assert [t for t in texts if claim_guard.claims_outcome(t)] == []

@@ -133,3 +133,19 @@ def test_recovery_delivers_the_reapproval_card(tmp_path):
     card = note["messages"][-1]
     assert card["kind"] == "card" and card["card"]["draft"]["price"] == 1250
     assert sim.agent.store.session_messages(sim.sid)[-1]["card"]["code"] == card["card"]["code"]
+
+
+def test_single_time_bound_is_open_ended(tmp_path):
+    """Bug #6: gpt-oss sent "not before 10 a.m." as time_from only; it became a 10:00-10:00 window, so no
+    slot fitted and the model told the user the provider had no slots (then invented one)."""
+    week = {"date_from": "2026-11-10", "date_to": "2026-11-15"}
+    llm = Scripted(call("update_request", service="electrician", area="Indiranagar", time_from="10:00", **week),
+                   call("search_providers", service="electrician", area="Indiranagar", date_range=list(week.values())),
+                   LLMResponse(text="Here are the options."))
+    agent, _, _ = agent_with(tmp_path, llm)
+    sid = agent.new_session()
+    agent.handle_user_message(sid, "Same electrician as last time, this week, not before 10 a.m.")
+    e = agent.store.latest_errand(sid)
+    assert e.request.time_window == ("10:00", "23:59") and e.request.date_range == ("2026-11-10", "2026-11-15")
+    suresh = next(o for o in e.selected["options"] if o["provider_id"] == "p-ele-02")
+    assert suresh["slots"] and all(s[11:16] >= "10:00" for s in suresh["slots"])
