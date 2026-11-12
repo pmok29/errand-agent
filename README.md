@@ -37,8 +37,14 @@ The agent talks to any OpenAI-compatible endpoint. Set these in `.env`:
 | `openrouter` | set `LLM_MODEL` | `OPENROUTER_API_KEY` |
 | `scripted` | the offline policy used by the evals | nothing |
 
-`LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY` override the preset. With `LLM_FALLBACK=ollama`, the
-agent switches to local Ollama when the primary provider is unreachable. If the chosen provider has
+`LLM_BASE_URL`, `LLM_MODEL` and `LLM_API_KEY` override the primary preset. `LLM_FALLBACK` is used when
+a call fails: `groq:qwen/qwen3.8-27b` (the default in `.env.example`) is another Groq model with its
+own rate-limit bucket, and `ollama` is local. A rate limit or outage falls back for that call only; a
+bad key or unknown model switches for good. Every fallback is traced as `llm_fallback`.
+
+**Groq free tier:** 8,000 tokens per minute and 200,000 per day, per model. A booking takes about
+5–9 LLM calls of about 3,000 tokens each, so expect pauses while the client waits out 429s, and a few
+dozen bookings a day. If the chosen provider has
 no key, the web app runs the scripted policy and says so in the top bar. Costs in the trace are
 estimates from the price table in `errand/config.py`.
 

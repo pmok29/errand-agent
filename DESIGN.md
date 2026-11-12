@@ -15,7 +15,7 @@ effects, verification and outcome messages. The hard parts belong in code, not i
 | DONE / FAILED / UNVERIFIED / ABORTED_LIMIT | `list_bookings`, memory tools |
 
 `book`, `cancel` and `reschedule` are never shown to the model. IDs and slots must come from earlier
-tool results. Limits: 12 LLM turns, 25 tool calls, 90 s per run; hitting one gives ABORTED_LIMIT plus a status.
+tool results. Limits: 12 LLM turns, 25 tool calls, 180 s per run (incl. rate-limit waits); hitting one gives ABORTED_LIMIT plus a status.
 
 **Approval enforcement.** `request_approval` builds an `ApprovalDraft` from persisted records (the
 hold's quote, or a booking from `list_bookings`), never from model arguments. The card and the hash
@@ -36,7 +36,7 @@ open executions resume by asking the provider, never by repeating the side effec
 messages) or *inferred* (a candidate until confirmed). Users can list, correct (supersede) and forget
 (redact every spelling: digits, +91, ₹/Rs). Each turn sends: system prompt, a STATE block with ≤ 8
 relevant usable memories, this session's history scrubbed of forgotten values, and this turn's tool
-outputs, under a fixed **6,000-token** budget. Earlier sessions never go raw. `context_sent` logs
+outputs, under a fixed **6,000-token** budget that includes the tool schemas. Earlier sessions never go raw. `context_sent` logs
 what was included and excluded, and why. Tool results are wrapped as untrusted; instruction-like free
 text is withheld. Safety doesn't rely on that: an obeyed injection still hits the gate (eval #4).
 
