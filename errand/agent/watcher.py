@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from errand.agent import approvals
 from errand.agent.approvals import fmt_slot
 from errand.agent.orchestrator import Agent
 from errand.agent.state import transition
@@ -33,21 +34,18 @@ class Watcher:
             return self._recheck_unverified() + self._provider_cancellations()
 
     # ---------- helpers ----------
-    def _notify(self, session_id: str, messages: list[dict]) -> dict[str, Any]:
-        self.store.add_notification(session_id, {"messages": messages})
-        return {"session_id": session_id, "messages": messages}
-
-    def _say(self, session_id: str, text: str, kind: str = "notification") -> dict:
-        return self.agent._reply(session_id, kind, text)
+    def _say(self, session_id: str, text: str) -> dict:
+        return self.agent.reply(session_id, "notification", text)
 
     def _list_bookings(self, user_id: str) -> ToolResult | None:
         try:
             r = self.agent.call("list_bookings", {"user_id": user_id})
         except ToolTimeout:
             r = None
-        self.tracer.emit("tool_call", actor="watcher", tool="list_bookings", args={"user_id": user_id},
-                         ok=bool(r and r.ok))
-        return r if r and r.ok else None
+        if not (r and r.ok):  # routine polls aren't traced; a change shows up as provider_cancel_* events
+            self.tracer.emit("tool_call", actor="watcher", tool="list_bookings", args={"user_id": user_id}, ok=False)
+            return None
+        return r
 
     # ---------- approvals ----------
     def _expire_approvals(self) -> None:
@@ -56,9 +54,7 @@ class Watcher:
             if is_expired(a.expires_at, now):
                 self.store.set_approval_status(a.id, ApprovalStatus.EXPIRED)
                 self.tracer.emit("approval_expired", errand_id=a.errand_id, approval_id=a.id, by="watcher")
-                e = self.store.get_errand(a.errand_id)
-                if e.state == S.AWAITING_APPROVAL:
-                    transition(self.store, self.tracer, e, S.COMPARING, "approval_expired")
+                approvals.reopen(self.store, self.tracer, self.store.get_errand(a.errand_id), "approval_expired")
 
     # ---------- UNVERIFIED follow-up ----------
     def _recheck_unverified(self) -> list[dict[str, Any]]:
@@ -70,36 +66,37 @@ class Watcher:
             if job["status"] != "open" or now < datetime.fromisoformat(job["next_run_at"]):
                 continue
             e = self.store.get_errand(exe.errand_id)
-            self.tracer.start_run(e.session_id, kind="watcher", job="unverified_recheck", attempt=job["attempts"] + 1)
-            outcome = self.agent.executor.recheck_unverified(exe)
             attempts = job["attempts"] + 1
-            if outcome is not None:
+            self.tracer.start_run(e.session_id, kind="watcher", job="unverified_recheck", attempt=attempts)
+            outcome = self.agent.executor.recheck_unverified(exe)
+            if outcome is not None or attempts >= job["max_attempts"]:
                 self.store.update_job(job["id"], attempts=attempts, status="done")
-                messages = [self._say(e.session_id, "Update: " + render(outcome))]
-            elif attempts >= job["max_attempts"]:
-                self.store.update_job(job["id"], attempts=attempts, status="done")
-                messages = [self._say(e.session_id, render(Outcome("unverified_final", e.id)))]
+                text = "Update: " + render(outcome) if outcome else render(Outcome("unverified_final", e.id))
+                messages = [self._say(e.session_id, text)]
             else:
                 nxt = datetime.fromisoformat(job["next_run_at"]) + timedelta(seconds=UNVERIFIED_GAPS_S[attempts])
                 self.store.update_job(job["id"], attempts=attempts, next_run_at=nxt.isoformat())
                 messages = []
             self.tracer.end_run(outcome=outcome.kind if outcome else "still_pending")
             if messages:
-                out.append(self._notify(e.session_id, messages))
+                out.append(self.agent.notify(e.session_id, messages))
         return out
 
     # ---------- provider cancellations ----------
     def _provider_cancellations(self) -> list[dict[str, Any]]:
-        baseline = not self.store.has_snapshots()  # first ever tick: record, don't alert on history
+        seen = self.store.snapshots()
+        baseline = not seen  # first ever tick: record, don't alert on history
         out = []
         for user in self.store.users():
             r = self._list_bookings(user)
             if r is None:
                 continue
             for b in r.data["bookings"]:
-                prev = self.store.snapshot(b["booking_id"])
+                prev = seen.get(b["booking_id"])
+                if prev == b["status"]:
+                    continue
                 self.store.set_snapshot(b["booking_id"], b["status"])
-                if baseline or b["status"] != "cancelled_by_provider" or prev == "cancelled_by_provider":
+                if baseline or b["status"] != "cancelled_by_provider":
                     continue
                 if note := self._handle_provider_cancel(user, b):
                     out.append(note)
@@ -151,4 +148,4 @@ class Watcher:
         if e.state != S.AWAITING_APPROVAL and not e.request.missing(e.kind):
             messages.append(self._say(session, render(Outcome("no_replacement", e.id))))
         self.tracer.end_run(outcome=e.state)
-        return self._notify(session, messages)
+        return self.agent.notify(session, messages)

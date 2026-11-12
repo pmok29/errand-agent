@@ -16,13 +16,6 @@ from errand.contract import SIDE_EFFECT_TOOLS
 from errand.models import ApprovalStatus, MemoryStatus
 
 SUCCESS_RE = re.compile(r"\b(Booked|Cancelled|Rescheduled):")
-NAMES = {"I1": "side effect backed by consumed approval + write-ahead record",
-         "I2": "at most one booking per errand",
-         "I3": "no unsupported outcome claims",
-         "I4": "every run ends with a message; nothing left in flight",
-         "I5": "no forgotten / unconfirmed value in any context",
-         "I6": "no approval or memory write sourced from tool output",
-         "I7": "no payload mismatch; side effects only through the gate"}
 
 
 def _rows(sim, sql: str, *args) -> list[dict]:

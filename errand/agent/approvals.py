@@ -79,11 +79,15 @@ def code_for(hash: str, approval_id: str) -> str:
     return base64.b32encode(hashlib.sha256(f"{hash}|{approval_id}".encode()).digest())[:4].decode()
 
 
+def over_budget(price: int | None, budget: int | None) -> bool:
+    return price is not None and budget is not None and price > budget
+
+
 def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> dict:
-    over_budget = draft.price is not None and budget is not None and draft.price > budget
+    over = over_budget(draft.price, budget)
     if draft.action == Action.BOOK:
         line = f"Book {draft.provider_name} on {fmt_slot(draft.slot)} for {fmt_money(draft.price)}"
-        if over_budget:
+        if over:
             line += f" (above your {fmt_money(budget)} budget)"
     elif draft.action == Action.CANCEL:
         line = f"Cancel your {draft.provider_name} booking on {fmt_slot(draft.slot)}"
@@ -92,7 +96,7 @@ def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> d
                 f"to {fmt_slot(draft.slot)}")
     text = f"{line}. Reply CONFIRM {code} to go ahead, or tell me what to change."
     return {"kind": "card", "text": text, "code": code, "draft": draft.model_dump(mode="json"),
-            "over_budget": over_budget}
+            "over_budget": over}
 
 
 def payload_for(store: Store, errand: Errand, draft: ApprovalDraft) -> dict:
@@ -103,8 +107,7 @@ def payload_for(store: Store, errand: Errand, draft: ApprovalDraft) -> dict:
     return {"booking_id": draft.booking_id, "slot": draft.slot}
 
 
-def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, ttl_s: int,
-           budget: int | None = None) -> tuple[Approval, dict]:
+def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, ttl_s: int) -> tuple[Approval, dict]:
     invalidate_pending(store, tracer, errand, "superseded")
     expires = store.clock.now() + timedelta(seconds=ttl_s)
     if draft.action == Action.BOOK:
@@ -116,13 +119,27 @@ def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, t
     store.insert_approval(a)
     tracer.emit("approval_created", errand_id=errand.id, approval_id=a.id, hash=h, code=a.code,
                 draft=draft.model_dump(mode="json"), expires_at=a.expires_at)
-    return a, render_card(draft, a.code, budget)
+    return a, render_card(draft, a.code, errand.request.budget_max)
 
 
 def invalidate_pending(store: Store, tracer: Tracer, errand: Errand, reason: str) -> None:
     for a in store.approvals_for(errand.id, ApprovalStatus.PENDING):
         store.set_approval_status(a.id, ApprovalStatus.INVALIDATED)
         tracer.emit("approval_invalidated", errand_id=errand.id, approval_id=a.id, reason=reason)
+
+
+def reopen(store: Store, tracer: Tracer, errand: Errand, reason: str) -> bool:
+    """After a card closes without being confirmed: back to the hold if it is still valid, else COMPARING.
+
+    Returns False (and changes nothing) when a newer card is still pending, i.e. the closed one was stale."""
+    if errand.state != ErrandState.AWAITING_APPROVAL:
+        return True
+    if store.approvals_for(errand.id, ApprovalStatus.PENDING):
+        return False
+    hold = store.latest_hold(errand.id)
+    held = action_for(errand.kind) == Action.BOOK and hold and not is_expired(hold.expires_at, store.clock.now())
+    transition(store, tracer, errand, ErrandState.HOLDING if held else ErrandState.COMPARING, reason)
+    return True
 
 
 def match_code(text: str) -> str | None:

@@ -2,8 +2,6 @@
 
 const $ = (id) => document.getElementById(id);
 const NOISE = new Set(["context_sent", "assistant_msg"]);
-// routine watcher polls are noise too; a poll that finds a change shows up as provider_cancel_* events
-const isNoise = (e) => NOISE.has(e.type) || (e.type === "tool_call" && e.actor === "watcher" && e.ok !== false);
 const KIND_TAG = { template: "status", notification: "update", card: "approval needed", memory_prompt: "memory" };
 let busy = false;
 let lastSeq = 0;   // the backlog and the live stream can overlap
@@ -30,18 +28,18 @@ function addMessage(m) {
     div.appendChild(tag);
   }
   div.appendChild(document.createTextNode(m.text));
-  if (kind === "card" && m.code) {
-    // only the newest card can be confirmed from the UI; older codes are rejected server-side anyway
-    document.querySelectorAll(".msg.card button").forEach((b) => { b.disabled = true; });
+  const cardCode = kind === "card" && m.card && m.card.code;
+  if (cardCode) {
+    retireCards();  // only the newest card can be confirmed from the UI; older codes are rejected server-side anyway
     const row = document.createElement("div");
     row.className = "card-actions";
     const btn = document.createElement("button");
     btn.className = "primary";
     btn.textContent = `Confirm`;
-    btn.title = `Sends "CONFIRM ${m.code}"`;
-    btn.onclick = () => { btn.disabled = true; send(`CONFIRM ${m.code}`); };
+    btn.title = `Sends "CONFIRM ${cardCode}"`;
+    btn.onclick = () => { btn.disabled = true; send(`CONFIRM ${cardCode}`); };
     const code = document.createElement("code");
-    code.textContent = `CONFIRM ${m.code}`;
+    code.textContent = `CONFIRM ${cardCode}`;
     row.append(btn, code);
     div.appendChild(row);
   }
@@ -58,6 +56,10 @@ function addMessage(m) {
   }
   $("log").appendChild(div);
   $("log").scrollTop = $("log").scrollHeight;
+}
+
+function retireCards() {
+  document.querySelectorAll(".msg.card button").forEach((b) => { b.disabled = true; });
 }
 
 function systemNote(text) {
@@ -92,6 +94,8 @@ const short = (v, n = 90) => {
   const s = typeof v === "string" ? v : JSON.stringify(v);
   return s && s.length > n ? s.slice(0, n) + "…" : s;
 };
+const META = new Set(["seq", "type", "ts", "run_id", "t_ms"]);
+const fields = (e, skip = []) => Object.fromEntries(Object.entries(e).filter(([k]) => !META.has(k) && !skip.includes(k)));
 const money = (c) => (c ? ` · ≈₹${c.inr.toFixed(2)}` : "");
 
 function summarize(e) {
@@ -129,11 +133,8 @@ function summarize(e) {
     case "limit_hit": return [`${e.limit} in ${e.state}`, "bad"];
     case "error": case "llm_error": return [short(e.error, 140), "bad"];
     case "assistant_msg": return [`${e.kind}: ${short(e.text, 120)}`, ""];
-    case "demo": return [`${e.action} ${short(Object.fromEntries(Object.entries(e).filter(([k]) => !["seq", "type", "ts", "run_id", "t_ms", "action"].includes(k))), 100)}`, "info"];
-    default: {
-      const rest = Object.fromEntries(Object.entries(e).filter(([k]) => !["seq", "type", "ts", "run_id", "t_ms"].includes(k)));
-      return [short(rest, 140), ""];
-    }
+    case "demo": return [`${e.action} ${short(fields(e, ["action"]), 100)}`, "info"];
+    default: return [short(fields(e), 140), ""];
   }
 }
 
@@ -143,7 +144,7 @@ function addEvent(e) {
   const [sum, cls] = summarize(e);
   const row = document.createElement("div");
   row.className = `ev ${cls}`;
-  row.dataset.noise = isNoise(e) ? "1" : "";
+  row.dataset.noise = NOISE.has(e.type) ? "1" : "";
   if (row.dataset.noise && $("hideNoise").checked) row.hidden = true;
   const cells = [e.seq, e.t_ms != null ? `${Math.round(e.t_ms)}ms` : "", e.type, sum];
   ["seq", "t", "type", "sum"].forEach((c, i) => {
@@ -176,9 +177,7 @@ function setState(s) {
   if (!sel.options.length) s.presets.forEach((p) => sel.add(new Option(p, p)));
   sel.value = s.preset;
   $("seed").checked = s.seeded;
-  if (!s.errand || s.errand.state !== "AWAITING_APPROVAL") {  // nothing to confirm: retire old buttons
-    document.querySelectorAll(".msg.card button").forEach((b) => { b.disabled = true; });
-  }
+  if (!s.errand || s.errand.state !== "AWAITING_APPROVAL") retireCards();  // nothing to confirm
 }
 
 function renderMemories(list) {
@@ -217,13 +216,12 @@ function renderMemories(list) {
 
 async function load() {
   const s = await api("/api/state");
-  setState(s);
   $("log").replaceChildren();
   $("trace").replaceChildren();
   lastSeq = 0;
   s.history.forEach(addMessage);
   s.trace.forEach(addEvent);
-  setState(s);  // again, now that the history's cards exist
+  setState(s);  // after the history, so its cards can be retired
   renderMemories(s.memories);
   if (!s.history.length) systemNote(`New session · scenario “${s.preset}”${s.seeded ? " · seeded profile (55 memories, past bookings)" : ""}`);
 }

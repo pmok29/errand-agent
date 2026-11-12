@@ -7,7 +7,6 @@ through `publish` to the live stream.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from pathlib import Path
 from typing import Any, Callable
@@ -24,8 +23,27 @@ from errand.models import MemoryStatus
 from errand.seed.seed import seed_user
 from errand.tracing.tracer import Tracer
 
-CODE_IN_TEXT = re.compile(r"CONFIRM ([A-Z2-7]{4})")
 TRACE_BACKLOG = 400
+CRASH_POINT = "book_returned"
+
+
+def for_browser(e: dict) -> dict:
+    """Trace events as the UI gets them: context_sent without the full prompt (it stays in the JSONL)."""
+    return {k: v for k, v in e.items() if k != "messages"} if e["type"] == "context_sent" else e
+
+
+class TracePublisher:
+    """Tracer subscriber that holds only the publish callable, not the whole Runtime."""
+
+    def __init__(self, publish: Callable[[dict], None]):
+        self.publish = publish
+
+    def __call__(self, e: dict) -> None:
+        self.publish({"channel": "trace", "event": for_browser(e)})
+
+
+def ui_message(kind: str, text: str, card: dict | None = None, role: str = "assistant") -> dict:
+    return {"role": role, "kind": kind, "text": text, **({"card": card} if card else {})}
 
 
 def make_llm():
@@ -46,8 +64,16 @@ class Runtime:
     def __init__(self, data_dir: Path, traces_dir: Path | None, publish: Callable[[dict], None] = lambda m: None,
                  llm_factory=make_llm):
         self.data_dir, self.traces_dir, self.publish, self.llm_factory = data_dir, traces_dir, publish, llm_factory
-        self.preset, self.seeded, self.crash_next = "normal", True, False
+        self.preset, self.seeded = "normal", True
+        self.faults: set[str] = set()   # shared with every executor we boot; firing a fault removes it
         self.reset()
+
+    @property
+    def crash_next(self) -> bool:
+        return CRASH_POINT in self.faults
+
+    def arm_crash(self, armed: bool) -> None:
+        (self.faults.add if armed else self.faults.discard)(CRASH_POINT)
 
     # ---------- lifecycle ----------
     def reset(self, preset_name: str | None = None, seed: bool | None = None) -> None:
@@ -61,55 +87,42 @@ class Runtime:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.clock = DemoClock()
         self.tracer = Tracer(self.traces_dir, self.clock)
-        self.tracer.subscribe(lambda e: self.publish({"channel": "trace", "event": e}))
+        self.tracer.subscribe(TracePublisher(self.publish))
         self.llm, self.llm_label = self.llm_factory()
-        self._boot(set())
+        self._boot()
         if self.seeded:
             seed_user(self.agent.store)
         self.session_id = self.agent.new_session()
         self.watcher.tick()                      # baseline snapshot of the user's bookings
         self.tracer.emit("demo", action="reset", preset=self.preset, seeded=self.seeded, llm=self.llm_label)
 
-    def _boot(self, faults: set[str]) -> None:
+    def _boot(self) -> None:
         self.mock = MockProviderService(self.data_dir / "mock.db", self.clock, preset(self.preset))
         self.agent = build_agent(self.data_dir / "agent.db", self.mock, self.llm, self.clock, self.tracer,
-                                 faults=faults)
+                                 faults=self.faults)
         self.watcher = Watcher(self.agent)
 
     def restart(self) -> list[dict]:
         """Simulate a process restart: new objects over the same databases, then recovery."""
         self.mock.close()
-        self._boot({"book_returned"} if self.crash_next else set())
+        self._boot()
         self.tracer.emit("demo", action="restart")
         self.agent.recover()
         return self.deliver()
 
     # ---------- chat ----------
     def say(self, text: str) -> dict[str, Any]:
-        faults = self.agent.executor.faults
-        if self.crash_next:
-            faults.add("book_returned")
         try:
             replies = self.agent.handle_user_message(self.session_id, text)
         except SimulatedCrash:
-            self.crash_next = False
-            self.tracer.emit("demo", action="crashed", point="book_returned")
+            self.tracer.emit("demo", action="crashed", point=CRASH_POINT)
             return {"replies": [], "crashed": True}
-        finally:
-            if not self.crash_next:
-                faults.discard("book_returned")
         return {"replies": replies, "crashed": False}
 
     def history(self) -> list[dict[str, Any]]:
-        out = []
-        for m in self.agent.store.session_messages(self.session_id):
-            if m["role"] == "user" and m["kind"] == "event":
-                continue  # system-authored notices sent to the model, not shown as chat
-            msg = {"role": m["role"], "kind": m["kind"], "text": m["content"]}
-            if m["kind"] == "card" and (code := CODE_IN_TEXT.search(m["content"])):
-                msg["code"] = code.group(1)
-            out.append(msg)
-        return out
+        return [ui_message(m["kind"], m["content"], m["card"], m["role"])
+                for m in self.agent.store.session_messages(self.session_id)
+                if not (m["role"] == "user" and m["kind"] == "event")]  # notices sent to the model, not chat
 
     # ---------- background work ----------
     def tick(self) -> list[dict]:
@@ -117,19 +130,11 @@ class Runtime:
         return self.deliver()
 
     def deliver(self) -> list[dict]:
-        """Push pending notifications to the browser. Recovery outcomes are also kept in the chat history."""
-        sent = []
-        for n in self.agent.store.take_notifications(self.session_id):
-            messages = n.get("messages") or [{"kind": n.get("kind", "template"), "text": n["text"]}]
-            if "messages" not in n:
-                for m in messages:
-                    self.agent.store.add_message(self.session_id, "assistant", m["text"], m["kind"])
-            for m in messages:
-                msg = {"role": "assistant", "kind": m["kind"], "text": m["text"]}
-                if m["kind"] == "card" and (code := CODE_IN_TEXT.search(m["text"])):
-                    msg["code"] = code.group(1)
-                self.publish({"channel": "chat", "message": msg})
-                sent.append(msg)
+        """Push system-initiated messages (watcher, recovery) to the browser; they are already in history."""
+        sent = [ui_message(m["kind"], m["text"], m.get("card"))
+                for n in self.agent.store.take_notifications(self.session_id) for m in n["messages"]]
+        for msg in sent:
+            self.publish({"channel": "chat", "message": msg})
         return sent
 
     # ---------- demo controls ----------
@@ -177,4 +182,4 @@ class Runtime:
                 "errand": {"kind": e.kind, "state": e.state} if e else None}
 
     def backlog(self) -> list[dict]:
-        return list(self.tracer.events)[-TRACE_BACKLOG:]
+        return [for_browser(e) for e in list(self.tracer.events)[-TRACE_BACKLOG:]]

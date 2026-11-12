@@ -19,9 +19,9 @@ def _pair(args: dict, a: str, b: str, current: tuple | None, label: str) -> tupl
     lo, hi = args.get(a), args.get(b)
     if lo is None and hi is None:
         return current
-    lo, hi = lo or (current[0] if current else None), hi or (current[1] if current else None)
-    if lo is None or hi is None:
-        lo, hi = lo or hi, hi or lo
+    if current:
+        lo, hi = lo or current[0], hi or current[1]
+    lo, hi = lo or hi, hi or lo  # one end given: a single day / instant
     if hi < lo:
         raise ValueError(f"{label}: {b} is before {a}")
     return (lo, hi)
@@ -44,8 +44,7 @@ def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]
                 date.fromisoformat(d)
             if req.date_range[1] < store.clock.now().date().isoformat():
                 raise ValueError("those dates are in the past")
-        tw = _pair(args, "time_from", "time_to", req.time_window, "time window")
-        req.time_window = (tw[0], tw[1]) if tw else None
+        req.time_window = _pair(args, "time_from", "time_to", req.time_window, "time window")
     except ValueError as err:
         return ToolResult.fail("invalid_request", message=str(err))
 
@@ -75,7 +74,7 @@ def request_approval(store: Store, tracer: Tracer, e: Errand, args: dict[str, An
                                       booking_id=args.get("booking_id"))
     except approvals.DraftError as err:
         return ToolResult.fail("cannot_request_approval", message=str(err)), None
-    _, card = approvals.create(store, tracer, e, draft, ttl_s, budget=e.request.budget_max)
+    _, card = approvals.create(store, tracer, e, draft, ttl_s)
     transition(store, tracer, e, S.AWAITING_APPROVAL, "approval_requested")
     return ToolResult.success(status="shown_to_user", code=card["code"]), card
 

@@ -278,6 +278,10 @@ class MockProviderService:
     def ledger(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM bookings ORDER BY booking_id")]
 
+    def agent_bookings(self) -> list[dict]:
+        """Bookings made through book() (seed bookings have no hold)."""
+        return [b for b in self.ledger() if b["hold_id"]]
+
     def idem_keys(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT key, action, payload_hash FROM idem")]
 

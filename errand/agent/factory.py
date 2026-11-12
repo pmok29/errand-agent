@@ -1,6 +1,7 @@
 """Wires an Agent to its databases, the mock provider and an LLM client."""
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 from errand.agent.llm.base import LLMClient
@@ -17,4 +18,4 @@ from errand.tracing.tracer import Tracer
 def build_agent(agent_db: Path, mock: MockProviderService, llm: LLMClient, clock: Clock, tracer: Tracer,
                 settings: Settings | None = None, faults: set[str] | None = None) -> Agent:
     store = Store(DB(agent_db), clock)
-    return Agent(store, lambda name, args: tools.call(mock, name, args), llm, tracer, clock, settings, faults)
+    return Agent(store, partial(tools.call, mock), llm, tracer, clock, settings, faults)

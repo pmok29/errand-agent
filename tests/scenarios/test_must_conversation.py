@@ -1,7 +1,6 @@
 """Baseline conversation: happy path (#1), missing details (#2), correction (#3), approval (#27), repeated code (#13)."""
 import pytest
 
-from errand.models import ErrandState as S
 from tests.harness import PLUMBER, Sim, SimUser, finish
 
 

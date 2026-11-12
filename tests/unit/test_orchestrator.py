@@ -1,12 +1,12 @@
 """Orchestrator behaviour that doesn't depend on the scripted policy: limits, gate denials, claims, codes."""
-from errand.agent.factory import build_agent
+import pytest
+
+from errand.agent.executor import SimulatedCrash
 from errand.agent.llm.base import LLMError, LLMResponse, ToolCall
 from errand.agent.llm.scripted import ReactivePolicy
-from errand.clock import FrozenClock
 from errand.mocks.scenario import ScenarioConfig
-from errand.mocks.service import MockProviderService
 from errand.models import ErrandState as S
-from errand.tracing.tracer import Tracer
+from tests.harness import Sim
 
 
 class Scripted:
@@ -29,10 +29,8 @@ def call(name, **args):
 
 
 def agent_with(tmp_path, llm, **cfg):
-    clock = FrozenClock()
-    mock = MockProviderService(tmp_path / "mock.db", clock, ScenarioConfig(**cfg))
-    tracer = Tracer(None, clock)
-    return build_agent(tmp_path / "agent.db", mock, llm, clock, tracer), mock, tracer
+    sim = Sim(tmp_path, ScenarioConfig(**cfg), llm=llm)
+    return sim.agent, sim.mock, sim.tracer
 
 
 def test_llm_cannot_book_and_never_sees_side_effect_tools(tmp_path):
@@ -42,7 +40,7 @@ def test_llm_cannot_book_and_never_sees_side_effect_tools(tmp_path):
     assert all(not ({"book", "cancel", "reschedule"} & tools) for tools, _ in llm.seen)
     denied = [e for e in tracer.of_type("gate_decision") if not e["allow"]]
     assert denied and denied[0]["tool"] == "book"
-    assert len(mock.ledger()) == 6
+    assert not mock.agent_bookings()
 
 
 def test_false_success_claim_is_replaced_by_state_template(tmp_path):
@@ -84,7 +82,7 @@ def test_reply_without_code_is_not_approval(tmp_path):
     agent.handle_user_message(sid, "yeah ok")
     assert agent.store.latest_errand(sid).state != S.EXECUTING
     stale = agent.handle_user_message(sid, f"CONFIRM {card['card']['code']}")
-    assert "no longer applies" in stale[0]["text"] and len(mock.ledger()) == 6
+    assert "no longer applies" in stale[0]["text"] and not mock.agent_bookings()
 
 
 def test_repeated_code_after_success_does_not_rebook(tmp_path):
@@ -94,7 +92,7 @@ def test_repeated_code_after_success_does_not_rebook(tmp_path):
     code = agent.handle_user_message(sid, "first one")[-1]["card"]["code"]
     assert agent.handle_user_message(sid, f"CONFIRM {code}")[0]["text"].startswith("Booked:")
     again = agent.handle_user_message(sid, f"CONFIRM {code}")
-    assert again[0]["text"].startswith("That's already done") and len(mock.ledger()) == 7
+    assert again[0]["text"].startswith("That's already done") and len(mock.agent_bookings()) == 1
 
 
 def test_change_of_errand_kind_is_persisted(tmp_path):
@@ -118,4 +116,20 @@ def test_stale_code_keeps_the_newer_card_open(tmp_path):
     assert "no longer applies" in stale and f"CONFIRM {new['code']}" in stale
     assert agent.store.latest_errand(sid).state == S.AWAITING_APPROVAL
     assert agent.handle_user_message(sid, f"CONFIRM {new['code']}")[0]["text"].startswith("Booked:")
-    assert sum(1 for b in mock.ledger() if b["hold_id"]) == 1
+    assert len(mock.agent_bookings()) == 1
+
+
+def test_recovery_delivers_the_reapproval_card(tmp_path):
+    """Recovery used to queue only text: a price change found while resuming lost its card and code."""
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["timeout_not_booked"]), faults={"book_returned"})
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    sim.say("option 1")
+    with pytest.raises(SimulatedCrash):
+        sim.confirm()
+    sim.clock.advance(601)                                   # the hold expires while the agent is down
+    sim.scenario.price_drift = {"p-plb-03": 100}             # and the re-hold quotes a new price
+    assert [o.kind for o in sim.restart()] == ["needs_reapproval"]
+    [note] = sim.agent.store.take_notifications(sim.sid)
+    card = note["messages"][-1]
+    assert card["kind"] == "card" and card["card"]["draft"]["price"] == 1250
+    assert sim.agent.store.session_messages(sim.sid)[-1]["card"]["code"] == card["card"]["code"]

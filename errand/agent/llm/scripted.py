@@ -83,7 +83,7 @@ def _memory_key(phrase: str, known: list[str]) -> str:
     best = max(known, key=lambda k: len(words & set(k.split("_"))), default=None)
     if best and words & set(best.split("_")):
         return best
-    return re.sub(r"[^a-z0-9]+", "_", phrase).strip("_")
+    return phrase  # memory_op normalises unknown keys itself
 
 
 def parse_memory_command(text: str, known: list[str]) -> tuple[str, dict] | None:
@@ -108,6 +108,15 @@ def parse_choice(text: str) -> int | None:
         if re.search(rf"\b{word}\b", t):
             return i
     return None
+
+
+def ask(missing: list[str]) -> str:
+    return " ".join(ASK.get(f, f"What is the {f}?") for f in missing)
+
+
+def search_args(request: dict) -> dict:
+    """search_providers arguments for a recorded request (the gate requires them to match exactly)."""
+    return {"service": request["service"], "area": request["area"], "date_range": request["date_range"]}
 
 
 def parse_time(text: str) -> str | None:
@@ -156,7 +165,10 @@ class ReactivePolicy:
         self._n = 0
 
     # ---------- response helpers ----------
-    def _respond(self, messages, text: str | None = None, call: tuple[str, dict] | None = None) -> LLMResponse:
+    def _respond(self, messages, decision: str | tuple[str, dict], text: str | None = None) -> LLMResponse:
+        """A reply for `decision` (text, or a tool call optionally with `text` alongside)."""
+        call = None if isinstance(decision, str) else decision
+        text = decision if call is None else text
         self._n += 1
         calls = [ToolCall(id=f"call_{self._n}", name=call[0], args=call[1])] if call else []
         out = text or json.dumps(call)
@@ -165,11 +177,7 @@ class ReactivePolicy:
                            output_tokens=estimate_tokens(out))
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
-        obs = observe(messages)
-        decision = self.decide(obs, {t["function"]["name"] for t in tools})
-        if isinstance(decision, str):
-            return self._respond(messages, text=decision)
-        return self._respond(messages, call=decision)
+        return self._respond(messages, self.decide(observe(messages), {t["function"]["name"] for t in tools}))
 
     # ---------- policy ----------
     def decide(self, obs: Observation, tools: set[str]) -> str | tuple[str, dict]:
@@ -180,7 +188,7 @@ class ReactivePolicy:
 
         if obs.user.startswith(NOTICE):
             if s["missing"]:
-                return " ".join(ASK.get(f, f"What is the {f}?") for f in s["missing"])
+                return ask(s["missing"])
             return self._book(obs, tools, done_names, auto_pick=True)
         known = [m["key"] for m in s.get("memories", [])]
         if (cmd := parse_memory_command(obs.user, known)) and "memory_op" in tools:
@@ -195,15 +203,15 @@ class ReactivePolicy:
             fields["area"] = remembered["preferred_area"]  # fill from memory rather than asking
         if fields and "update_request" in tools and "update_request" not in done_names:
             return ("update_request", fields)
-        if (m := re.search(r"not before (\d{1,2})\s*([ap]\.?m\.?)?", obs.user.lower())) \
+        if "not before" in obs.user.lower() and "time_from" in fields \
                 and "propose_memory" in tools and "propose_memory" not in done_names:
             # a time limit stated for this request might be a standing preference: an inference to confirm later
-            return ("propose_memory", {"key": "earliest_time", "value": _hour(m.group(1), m.group(2)), "explicit": False})
+            return ("propose_memory", {"key": "earliest_time", "value": fields["time_from"], "explicit": False})
         kind = s["errand"]["kind"]
         if kind in ("reschedule", "cancel") and "booking_id" in s["missing"]:
             return self._find_booking(obs, tools, done_names)
         if s["missing"]:
-            return " ".join(ASK.get(f, f"What is the {f}?") for f in s["missing"])
+            return ask(s["missing"])
         if kind in ("book", "rebook"):
             return self._book(obs, tools, done_names)
         return self._change_booking(obs, tools, done_names, remembered)
@@ -239,7 +247,7 @@ class ReactivePolicy:
                 if "get_provider" not in done_names:
                     return ("get_provider", {"provider_id": booking["provider_id"]})
                 area = (obs.last_result or {}).get("data", {}).get("areas", [None])[0]
-            return ("search_providers", {"service": booking["service"], "area": area, "date_range": r["date_range"]})
+            return ("search_providers", search_args({**r, "service": booking["service"], "area": area}))
         if (slot := pick_slot(obs.user, mine["slots"])) and "request_approval" not in done_names:
             return ("request_approval", {"action": "reschedule", "booking_id": booking["id"], "slot": slot})
         if not mine["slots"]:
@@ -264,14 +272,15 @@ class ReactivePolicy:
         options = s["options"]
         viable = [o for o in options if o["within_budget"] and o["slots"]]
         hold = s["hold"]
-        if s["errand"]["state"] == "HOLDING" and hold and "hold_slot" in done_names:
-            data = (obs.last_result or {}).get("data", {})
-            if data.get("over_budget") and not auto_pick:  # ask before showing a card above the budget
-                return (f"The provider now quotes ₹{hold['quoted_price']:,} (search showed ₹{hold['search_price']:,}), "
-                        f"above your ₹{s['request']['budget_max']:,} budget. Should I go ahead at that price?")
-            return ("request_approval", {"action": "book"})
-        if s["errand"]["state"] == "HOLDING" and hold and AFFIRM.match(obs.user):
-            return ("request_approval", {"action": "book"})
+        if s["errand"]["state"] == "HOLDING" and hold:
+            if "hold_slot" in done_names:
+                if (obs.last_result or {}).get("data", {}).get("over_budget") and not auto_pick:
+                    # ask before showing a card above the budget
+                    return (f"The provider now quotes ₹{hold['quoted_price']:,} (search showed ₹{hold['search_price']:,}), "
+                            f"above your ₹{s['request']['budget_max']:,} budget. Should I go ahead at that price?")
+                return ("request_approval", {"action": "book"})
+            if AFFIRM.match(obs.user):
+                return ("request_approval", {"action": "book"})
         if hold and (t := parse_time(obs.user)) and "hold_slot" in tools and "hold_slot" not in done_names:
             # a different time with the provider already held
             held = next((o for o in options if o["provider_id"] == hold["provider_id"]), {"slots": []})
@@ -285,7 +294,7 @@ class ReactivePolicy:
             return ("hold_slot", {"provider_id": pick["provider_id"], "slot": pick["slots"][0]})
         if not options and "search_providers" in tools and "search_providers" not in done_names:
             r = s["request"]
-            return ("search_providers", {"service": r["service"], "area": r["area"], "date_range": r["date_range"]})
+            return ("search_providers", search_args(r))
         if "search_providers" in done_names:
             detailed = {a.get("provider_id") for n, a in obs.done if n == "get_provider"}
             for o in viable[:3]:

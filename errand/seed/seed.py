@@ -83,13 +83,10 @@ def seed_user(store: Store, user_id: str = "u1") -> str:
     for role, text in _old_session_lines():
         store.add_message(old, role, text)
     with store.db.tx():
-        for key, value, scope in SUPERSEDED:
-            m = mem.add(user_id, key, value, Src.EXPLICIT, St.ACTIVE, scope, evidence_session_id=old)
-            mem._set(m.id, status=St.SUPERSEDED)
+        for key, value, scope in SUPERSEDED:   # older values, each replaced below through the real path
+            mem.add(user_id, key, value, Src.EXPLICIT, St.ACTIVE, scope, evidence_session_id=old)
         for key, value, scope in EXPLICIT:
-            m = mem.add(user_id, key, value, Src.EXPLICIT, St.ACTIVE, scope, evidence_session_id=old)
-            store.db.conn.execute("UPDATE memories SET superseded_by=? WHERE user_id=? AND key=? AND status=?",
-                                  (m.id, user_id, key, St.SUPERSEDED))
+            mem.correct(user_id, key, value, scope, session_id=old)
         for key, value in FORGOTTEN:
             mem.add(user_id, key, value, Src.EXPLICIT, St.ACTIVE, evidence_session_id=old)
             mem.forget(user_id, key)

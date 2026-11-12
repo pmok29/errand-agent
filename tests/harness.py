@@ -97,8 +97,10 @@ class Sim:
                 if (tool is None or e["tool"] == tool) and (actor is None or e["actor"] == actor)]
 
     def new_bookings(self) -> list[dict]:
-        """Bookings the agent made (seed bookings have no hold)."""
-        return [b for b in self.mock.ledger() if b["hold_id"]]
+        return self.mock.agent_bookings()
+
+    def booking(self, booking_id: str) -> dict:
+        return next(b for b in self.mock.ledger() if b["booking_id"] == booking_id)
 
     def errand(self, session_id: str | None = None):
         return self.agent.store.latest_errand(session_id or self.sid)

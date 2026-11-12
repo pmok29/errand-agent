@@ -12,6 +12,7 @@ from errand.models import Memory, MemorySource as Src, MemoryStatus as St
 TOKEN = re.compile(r"[a-z]+|\d+")
 IGNORED_TOKENS = {"00"}          # "10:00" should match "10 a.m."
 USABLE = (St.ACTIVE, St.CONFIRMED)
+UNUSABLE_REASON = {St.FORGOTTEN: "forgotten", St.SUPERSEDED: "superseded", St.CANDIDATE: "unconfirmed_inference"}
 # Memories that can fill a request field rank above everything else, whatever their age.
 REQUEST_KEYS = ("preferred_area", "earliest_time", "latest_time")
 SERVICE_REQUEST_KEYS = ("budget_{s}", "preferred_provider_{s}", "{s}_time")
@@ -81,7 +82,7 @@ class MemoryStore:
 
     def current(self, user_id: str, key: str) -> list[Memory]:
         """Rows that currently stand for `key` (usable or awaiting confirmation)."""
-        return [m for m in self.all(user_id) if m.key == key and m.status in (*USABLE, St.CANDIDATE)]
+        return [m for m in self.visible(user_id) if m.key == key]
 
     def value(self, user_id: str, key: str) -> str | None:
         """The usable (explicit or confirmed) value for `key`, if any. Candidates never count."""
@@ -97,10 +98,14 @@ class MemoryStore:
                 evidence_msg_id: str | None = None, session_id: str | None = None) -> Memory:
         with self.db.tx():
             new = self.add(user_id, key, value, Src.EXPLICIT, St.ACTIVE, scope, evidence_msg_id, session_id)
-            for old in self.current(user_id, key):
-                if old.id != new.id:
-                    self._set(old.id, status=St.SUPERSEDED, superseded_by=new.id)
+            self._supersede(new)
         return new
+
+    def _supersede(self, keep: Memory) -> None:
+        """Every other current row for keep's key is replaced by it."""
+        for old in self.current(keep.user_id, keep.key):
+            if old.id != keep.id:
+                self._set(old.id, status=St.SUPERSEDED, superseded_by=keep.id)
 
     def forget(self, user_id: str, key: str) -> list[Memory]:
         forgotten = self.current(user_id, key)
@@ -114,9 +119,7 @@ class MemoryStore:
         m = self.get(memory_id)
         if accept:
             with self.db.tx():
-                for old in self.current(m.user_id, m.key):
-                    if old.id != m.id:
-                        self._set(old.id, status=St.SUPERSEDED, superseded_by=m.id)
+                self._supersede(m)
                 self._set(m.id, status=St.CONFIRMED)
         else:
             self._set(m.id, status=St.FORGOTTEN)
@@ -139,38 +142,34 @@ class MemoryStore:
                 return r["id"]
         return None
 
-    def next_prompt(self, user_id: str, session_id: str) -> Memory | None:
-        rows = [m for m in self.all(user_id) if m.status == St.CANDIDATE and not m.prompted
+    def _candidates(self, user_id: str, session_id: str, prompted: bool) -> list[Memory]:
+        return [m for m in self.all(user_id) if m.status == St.CANDIDATE and bool(m.prompted) == prompted
                 and m.evidence_session_id == session_id]
-        return rows[0] if rows else None
+
+    def next_prompt(self, user_id: str, session_id: str) -> Memory | None:
+        return next(iter(self._candidates(user_id, session_id, prompted=False)), None)
 
     def mark_prompted(self, memory_id: str) -> None:
         self._set(memory_id, prompted=1)
 
     def last_prompted(self, user_id: str, session_id: str) -> Memory | None:
-        rows = [m for m in self.all(user_id) if m.status == St.CANDIDATE and m.prompted
-                and m.evidence_session_id == session_id]
+        rows = self._candidates(user_id, session_id, prompted=True)
         return rows[-1] if rows else None
 
     # ---------- what the model may see ----------
     def select(self, user_id: str, service: str | None, limit: int) -> Selection:
-        included, excluded = [], []
+        excluded: list[tuple[Memory, str]] = []
         ranked: list[tuple[int, Memory]] = []
         for age, m in enumerate(self.all(user_id)):  # all() is oldest first
-            if m.status == St.FORGOTTEN:
-                excluded.append((m, "forgotten"))
-            elif m.status == St.SUPERSEDED:
-                excluded.append((m, "superseded"))
-            elif m.status == St.CANDIDATE:
-                excluded.append((m, "unconfirmed_inference"))
+            if reason := UNUSABLE_REASON.get(m.status):
+                excluded.append((m, reason))
             elif m.scope == "global" or (service and m.scope == f"service:{service}"):
                 ranked.append((age, m))
             else:
                 excluded.append((m, "irrelevant_scope"))
         ranked.sort(key=lambda am: (relevance(am[1], service), -am[0]))  # then newest first
-        for i, (_, m) in enumerate(ranked):
-            (included.append(m) if i < limit else excluded.append((m, "over_limit")))
-        return Selection(included, excluded)
+        excluded += [(m, "over_limit") for _, m in ranked[limit:]]
+        return Selection([m for _, m in ranked[:limit]], excluded)
 
     def redaction_values(self, user_id: str) -> list[str]:
         """Forgotten values (all spellings): scrubbed from any history sent to the model.

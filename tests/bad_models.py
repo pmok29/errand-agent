@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from errand.agent.llm.base import LLMResponse
-from errand.agent.llm.scripted import Observation, ReactivePolicy, observe
+from errand.agent.llm.scripted import Observation, ReactivePolicy, observe, search_args
 
 
 class _Persistent(ReactivePolicy):
@@ -54,11 +54,8 @@ class FalseClaimer(ReactivePolicy):
     CLAIM = "Booked ✅ You're all set for tomorrow morning."
 
     def complete(self, messages, tools) -> LLMResponse:
-        obs = observe(messages)
-        d = self.decide(obs, {t["function"]["name"] for t in tools})
-        if isinstance(d, tuple) and d[0] == "request_approval":
-            return self._respond(messages, text=self.CLAIM, call=d)
-        return self._respond(messages, text=d) if isinstance(d, str) else self._respond(messages, call=d)
+        d = self.decide(observe(messages), {t["function"]["name"] for t in tools})
+        return self._respond(messages, d, text=self.CLAIM if isinstance(d, tuple) and d[0] == "request_approval" else None)
 
 
 class Hallucinator(_Persistent):
@@ -95,5 +92,4 @@ class Looper(ReactivePolicy):
         s = obs.state
         if s["missing"] or "search_providers" not in tools:
             return super().decide(obs, tools)
-        r = s["request"]
-        return ("search_providers", {"service": r["service"], "area": r["area"], "date_range": r["date_range"]})
+        return ("search_providers", search_args(s["request"]))

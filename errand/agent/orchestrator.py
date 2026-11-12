@@ -9,7 +9,7 @@ from datetime import timedelta
 from typing import Any, Callable
 
 from errand.agent import approvals, claim_guard, context, internal_tools, sanitize
-from errand.agent.executor import Executor, SimulatedCrash
+from errand.agent.executor import Executor
 from errand.agent.gate import Gate, slot_outside_request
 from errand.agent.llm.base import LLMClient, LLMError, ToolCall
 from errand.agent.memory import MemoryStore
@@ -18,9 +18,9 @@ from errand.agent.state import transition
 from errand.agent.store import Store
 from errand.agent.templates import Outcome, for_state, render, repeat_confirmation
 from errand.agent.tool_schemas import schemas_for
-from errand.clock import Clock, is_expired
+from errand.clock import Clock
 from errand.config import Settings
-from errand.models import ApprovalStatus, Errand, ErrandKind, ErrandState as S, Request, ToolResult, ToolTimeout
+from errand.models import Errand, ErrandKind, ErrandState as S, Request, ToolResult, ToolTimeout
 from errand.tracing.tracer import Tracer
 
 ToolCallFn = Callable[[str, dict], ToolResult]
@@ -64,7 +64,17 @@ class Agent:
         return self.store.create_session(user_id)
 
     def recover(self) -> list[Outcome]:
-        return recover(self.executor, self.tracer)
+        """Finish in-flight side effects after a restart and tell each user what happened."""
+        outcomes = recover(self.executor, self.tracer)
+        for o in outcomes:
+            e = self.store.get_errand(o.errand_id)
+            self.notify(e.session_id, self._outcome(e, o))
+        return outcomes
+
+    def notify(self, session_id: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Queue messages the system produced on its own (already in the chat history) for delivery."""
+        self.store.add_notification(session_id, {"messages": messages})
+        return {"session_id": session_id, "messages": messages}
 
     def handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
         with self.lock:
@@ -73,28 +83,25 @@ class Agent:
     def run_proactive(self, e: Errand, notice: str) -> list[dict[str, Any]]:
         """An LLM run started by the system (no user message). The notice is code-authored and marked as such."""
         self.store.add_message(e.session_id, "user", f"[Automated notice, not from the user] {notice}", kind="event")
-        try:
-            return self._llm_loop(e)
-        except SimulatedCrash:
-            raise
-        except Exception as err:
-            self.tracer.emit("error", error=repr(err))
-            return [self._reply(e.session_id, "template", INTERNAL_ERROR)]
+        return self._safely(e.session_id, self._llm_loop, e)
 
     def _handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
         self.tracer.start_run(session_id, kind="user_message")
         self.tracer.emit("user_msg", text=text)
         self.store.add_message(session_id, "user", text)
-        try:
-            out = self._handle(session_id, text)
-        except SimulatedCrash:  # tests: the process "dies" here; recovery runs in a new Agent
-            raise
-        except Exception as err:  # every exit path produces a clear user-facing outcome
-            self.tracer.emit("error", error=repr(err))
-            out = [self._reply(session_id, "template", INTERNAL_ERROR)]
+        out = self._safely(session_id, self._handle, session_id, text)
         e = self.store.latest_errand(session_id)
         self.tracer.end_run(outcome=e.state if e else "no_errand", replies=[m["kind"] for m in out])
         return out
+
+    def _safely(self, session_id: str, fn: Callable[..., list[dict[str, Any]]], *args) -> list[dict[str, Any]]:
+        """Every exit path produces a clear user-facing outcome. (SimulatedCrash is a BaseException:
+        it models the process dying, so it passes through.)"""
+        try:
+            return fn(*args)
+        except Exception as err:
+            self.tracer.emit("error", error=repr(err))
+            return [self.reply(session_id, "template", INTERNAL_ERROR)]
 
     # ---------- routing ----------
     def _handle(self, session_id: str, text: str) -> list[dict[str, Any]]:
@@ -103,22 +110,14 @@ class Agent:
         if (code := approvals.match_code(text)) is not None:
             e = self.store.latest_errand(session_id)
             if e is None:
-                return [self._reply(session_id, "template", "There's nothing waiting for confirmation.")]
+                return [self.reply(session_id, "template", "There's nothing waiting for confirmation.")]
             return self._confirm(e, code)
         e = self.store.active_errand(session_id) or self.store.create_errand(
             self.store.session_user(session_id), session_id, ErrandKind.BOOK)
         if e.state == S.AWAITING_APPROVAL:  # anything other than the code is not approval
             approvals.invalidate_pending(self.store, self.tracer, e, "user_replied_without_code")
-            transition(self.store, self.tracer, e, self._after_card(e), "user_replied_without_code")
+            approvals.reopen(self.store, self.tracer, e, "user_replied_without_code")
         return self._llm_loop(e)
-
-    def _after_card(self, e: Errand) -> S:
-        """Where a dismissed card leaves the errand: back to the hold if it is still valid."""
-        hold = self.store.latest_hold(e.id)
-        if approvals.action_for(e.kind) == approvals.Action.BOOK and hold \
-                and not is_expired(hold.expires_at, self.clock.now()):
-            return S.HOLDING
-        return S.COMPARING
 
     def _confirm(self, e: Errand, code: str) -> list[dict[str, Any]]:
         res = approvals.consume(self.store, self.tracer, e, code)
@@ -129,14 +128,12 @@ class Agent:
             return self._outcome(e, repeat_confirmation(self.store, e))
         kind = {"expired": "approval_expired", "changed": "approval_changed",
                 "invalidated": "approval_changed"}.get(res.status)
-        if kind and e.state == S.AWAITING_APPROVAL:
-            if self.store.approvals_for(e.id, ApprovalStatus.PENDING):  # an old code; the newer card stays open
-                return [self._reply(e.session_id, "template",
-                                    f"{render(Outcome(kind, e.id))} {render(for_state(self.store, e))}")]
-            transition(self.store, self.tracer, e, S.COMPARING, f"approval_{res.status}")
         if kind:
+            if not approvals.reopen(self.store, self.tracer, e, f"approval_{res.status}"):  # newer card stays open
+                return [self.reply(e.session_id, "template",
+                                   f"{render(Outcome(kind, e.id))} {render(for_state(self.store, e))}")]
             return self._outcome(e, Outcome(kind, e.id))
-        return [self._reply(e.session_id, "template", "That code doesn't match anything waiting for confirmation. "
+        return [self.reply(e.session_id, "template", "That code doesn't match anything waiting for confirmation. "
                             + render(for_state(self.store, e)))]
 
     # ---------- LLM loop ----------
@@ -159,7 +156,7 @@ class Agent:
                 resp = self.llm.complete(ctx.messages, schemas_for(e.state))
             except LLMError as err:
                 self.tracer.emit("llm_error", error=str(err), retryable=err.retryable)
-                return [self._reply(e.session_id, "template", LLM_UNAVAILABLE)]
+                return [self.reply(e.session_id, "template", LLM_UNAVAILABLE)]
             llm_turns += 1
             self.tracer.llm_call(resp.model, resp.latency_ms, resp.input_tokens, resp.output_tokens,
                                  text=resp.text, tool_calls=[{"name": c.name, "args": c.args} for c in resp.tool_calls])
@@ -225,15 +222,14 @@ class Agent:
             prov = self.store.ref(e.id, "provider", args["provider_id"]) or {}
             hold = self.store.record_hold(e.id, args["provider_id"], args["slot"], result, prov.get("price"))
             transition(self.store, self.tracer, e, S.HOLDING, "slot_held")
-            budget = e.request.budget_max
             return ToolResult.success(**result.data, search_price=hold.search_price,
                                       price_changed=hold.search_price is not None and hold.quoted_price != hold.search_price,
-                                      over_budget=budget is not None and hold.quoted_price > budget), None
+                                      over_budget=approvals.over_budget(hold.quoted_price, e.request.budget_max)), None
         return result, None
 
     # ---------- replies ----------
-    def _reply(self, session_id: str, kind: str, text: str, card: dict | None = None) -> dict[str, Any]:
-        self.store.add_message(session_id, "assistant", text, kind)
+    def reply(self, session_id: str, kind: str, text: str, card: dict | None = None) -> dict[str, Any]:
+        self.store.add_message(session_id, "assistant", text, kind, card)
         self.tracer.emit("assistant_msg", kind=kind, text=text, card=card)
         return {"kind": kind, "text": text, **({"card": card} if card else {})}
 
@@ -242,29 +238,30 @@ class Agent:
         if missing := [f for f in e.request.missing(e.kind) if f not in e.asked]:
             e.asked += missing  # the model just asked for these; don't let it ask again
             self.store.save_errand(e)
-        text = text or "Sorry, could you rephrase that?"
-        if not claim_guard.allowed(text, e.state):
-            replacement = render(for_state(self.store, e))
-            self.tracer.emit("claim_blocked", errand_id=e.id, state=e.state, original=text, replacement=replacement)
-            text = replacement
-        return self._reply(e.session_id, "chat", text)
+        text = self._guard(e, text or "Sorry, could you rephrase that?", render(for_state(self.store, e)))
+        return self.reply(e.session_id, "chat", text)
+
+    def _guard(self, e: Errand, text: str, fallback: str | None) -> str | None:
+        """Model text that claims an outcome the persisted state doesn't support is replaced by `fallback`."""
+        if claim_guard.allowed(text, e.state):
+            return text
+        self.tracer.emit("claim_blocked", errand_id=e.id, state=e.state, original=text, replacement=fallback)
+        return fallback
 
     def _card(self, e: Errand, preface: str | None, card: dict) -> list[dict[str, Any]]:
         out = []
-        if preface and claim_guard.allowed(preface, e.state):
-            out.append(self._reply(e.session_id, "chat", preface))
-        elif preface:  # the card itself is the truthful status
-            self.tracer.emit("claim_blocked", errand_id=e.id, state=e.state, original=preface, replacement=card["text"])
-        out.append(self._reply(e.session_id, "card", card["text"], card))
+        if preface and self._guard(e, preface, None):  # a blocked preface is dropped: the card is the status
+            out.append(self.reply(e.session_id, "chat", preface))
+        out.append(self.reply(e.session_id, "card", card["text"], card))
         return out
 
     def _outcome(self, e: Errand, o: Outcome) -> list[dict[str, Any]]:
-        out = [self._reply(e.session_id, "template", render(o))]
+        out = [self.reply(e.session_id, "template", render(o))]
         if o.card:
-            out.append(self._reply(e.session_id, "card", o.card["text"], o.card))
+            out.append(self.reply(e.session_id, "card", o.card["text"], o.card))
         if o.kind in SUCCESS and (m := self.memory.next_prompt(e.user_id, e.session_id)):
             self.memory.mark_prompted(m.id)  # ask once, after the errand, about one inferred preference
-            out.append(self._reply(e.session_id, "memory_prompt",
+            out.append(self.reply(e.session_id, "memory_prompt",
                                    f'Should I remember "{m.key.replace("_", " ")}: {m.value}" for future requests? '
                                    'Reply "remember yes" or "remember no".', {"memory_id": m.id}))
         return out
@@ -273,12 +270,12 @@ class Agent:
         user = self.store.session_user(session_id)
         m = self.memory.last_prompted(user, session_id)
         if m is None:
-            return [self._reply(session_id, "template", "There's nothing waiting for a yes or no.")]
+            return [self.reply(session_id, "template", "There's nothing waiting for a yes or no.")]
         self.memory.confirm(m.id, accept)
         self.tracer.emit("memory_confirmed" if accept else "memory_rejected", key=m.key, value=m.value)
         text = (f'Saved: "{m.key.replace("_", " ")}: {m.value}".' if accept
                 else f'Okay, I won\'t remember "{m.key.replace("_", " ")}".')
-        return [self._reply(session_id, "template", text)]
+        return [self.reply(session_id, "template", text)]
 
     def _limit(self, e: Errand, which: str) -> list[dict[str, Any]]:
         self.tracer.emit("limit_hit", errand_id=e.id, limit=which, state=e.state)

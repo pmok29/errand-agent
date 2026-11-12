@@ -77,9 +77,8 @@ class Store:
         return row["id"] if row else None
 
     def rebook_exists(self, user_id: str, booking_id: str) -> bool:
-        rows = self.db.all("SELECT request_json FROM errands WHERE user_id=? AND kind='rebook' AND state<>'FAILED'",
-                           user_id)
-        return any(Request.model_validate_json(r["request_json"]).booking_id == booking_id for r in rows)
+        return self.db.one("SELECT 1 FROM errands WHERE user_id=? AND kind='rebook' AND state<>'FAILED' "
+                           "AND json_extract(request_json, '$.booking_id')=? LIMIT 1", user_id, booking_id) is not None
 
     def latest_errand(self, session_id: str) -> Errand | None:
         row = self.db.one("SELECT * FROM errands WHERE session_id=? ORDER BY rowid DESC LIMIT 1", session_id)
@@ -256,24 +255,23 @@ class Store:
             ExecState.EXECUTING, ExecState.VERIFYING)]
 
     # ---------- chat messages ----------
-    def add_message(self, session_id: str, role: str, content: str, kind: str = "chat") -> str:
+    def add_message(self, session_id: str, role: str, content: str, kind: str = "chat",
+                    card: dict | None = None) -> str:
         mid = new_id("m")
-        self.db.conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?)",
-                             (mid, session_id, role, content, kind, self._now()))
+        self.db.conn.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+                             (mid, session_id, role, content, kind, self._now(), json.dumps(card) if card else None))
         return mid
 
-    def session_messages(self, session_id: str, limit: int | None = None) -> list[dict[str, str]]:
-        rows = self.db.all("SELECT role, content, kind FROM messages WHERE session_id=? ORDER BY rowid DESC"
+    def session_messages(self, session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        rows = self.db.all("SELECT role, content, kind, card_json FROM messages WHERE session_id=? ORDER BY rowid DESC"
                            + (f" LIMIT {int(limit)}" if limit else ""), session_id)
-        return [dict(r) for r in reversed(rows)]
+        return [{"role": r["role"], "content": r["content"], "kind": r["kind"],
+                 "card": json.loads(r["card_json"]) if r["card_json"] else None} for r in reversed(rows)]
 
     # ---------- watcher bookkeeping ----------
-    def snapshot(self, booking_id: str) -> str | None:
-        row = self.db.one("SELECT status FROM booking_snapshots WHERE booking_id=?", booking_id)
-        return row["status"] if row else None
-
-    def has_snapshots(self) -> bool:
-        return self.db.one("SELECT 1 FROM booking_snapshots LIMIT 1") is not None
+    def snapshots(self) -> dict[str, str]:
+        """Last seen status per booking_id."""
+        return {r["booking_id"]: r["status"] for r in self.db.all("SELECT booking_id, status FROM booking_snapshots")}
 
     def set_snapshot(self, booking_id: str, status: str) -> None:
         self.db.conn.execute("INSERT INTO booking_snapshots VALUES (?,?,?) ON CONFLICT(booking_id) DO UPDATE SET "
@@ -307,8 +305,9 @@ class Store:
         return [json.loads(r["payload_json"]) for r in rows]
 
     def take_notifications(self, session_id: str) -> list[dict[str, Any]]:
-        """Pending notifications, marked delivered."""
-        with self.db.tx():
-            out = self.pending_notifications(session_id)
-            self.db.conn.execute("UPDATE notifications SET delivered=1 WHERE session_id=?", (session_id,))
-        return out
+        """Pending notifications, marked delivered. A no-op read when nothing is pending (the common case)."""
+        rows = self.db.all("SELECT id, payload_json FROM notifications WHERE session_id=? AND delivered=0 "
+                           "ORDER BY rowid", session_id)
+        if rows:
+            self.db.conn.executemany("UPDATE notifications SET delivered=1 WHERE id=?", [(r["id"],) for r in rows])
+        return [json.loads(r["payload_json"]) for r in rows]

@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
-    content TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'chat', created_at TEXT NOT NULL
+    content TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'chat', created_at TEXT NOT NULL,
+    card_json TEXT
 );
 CREATE TABLE IF NOT EXISTS errands (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL,

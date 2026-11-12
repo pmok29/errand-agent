@@ -109,7 +109,7 @@ def test_14a_restart_mid_booking(tmp_path, ev):
     after = [c["tool"] for c in sim.tool_calls(actor="executor")]
     assert after[after.index("book") + 1] == "get_booking_status" and after.count("book") == 1
     [note] = sim.agent.store.pending_notifications(sim.sid)
-    assert note["text"].startswith("Booked:") and len(sim.new_bookings()) == 1
+    assert note["messages"][0]["text"].startswith("Booked:") and len(sim.new_bookings()) == 1
     ev.actual = "crash after book → restart → status by persisted key → booked; 1 booking; notification queued"
     finish(sim, ev, crashes=1)
 
@@ -129,8 +129,7 @@ def test_15_reschedule_conflict(tmp_path, ev):
     assert out[0]["text"].startswith("Rescheduled:")
     exes = sim.agent.store.executions_for(sim.errand().id)
     assert [x.attempt_no for x in exes] == [1, 2] and len(set(keys(sim, "reschedule"))) == 2
-    [b] = [b for b in sim.mock.ledger() if b["booking_id"] == "b-ac-wed"]
-    assert b["slot"] == "2026-11-14T15:00"
+    assert sim.booking("b-ac-wed")["slot"] == "2026-11-14T15:00"
     ev.actual = "14:00 → slot_conflict; 15:00 → attempt 2, new key → rescheduled once"
     finish(sim, ev)
 
@@ -146,6 +145,6 @@ def test_17_cancel_503_then_ok(tmp_path, ev):
     assert len(ks) == 2 and len(set(ks)) == 1 and out[0]["text"].startswith("Cancelled:")
     calls = [c["tool"] for c in sim.tool_calls(actor="executor")]
     assert calls[-1] == "list_bookings"
-    assert next(b for b in sim.mock.ledger() if b["booking_id"] == "b-plb-up")["status"] == "cancelled"
+    assert sim.booking("b-plb-up")["status"] == "cancelled"
     ev.actual = "503 → same-key retry → cancelled; confirmed via list_bookings"
     finish(sim, ev)

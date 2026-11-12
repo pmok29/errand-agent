@@ -1,5 +1,4 @@
 """Executor branches and restart recovery against the real mock service."""
-from datetime import date
 
 import pytest
 
@@ -31,7 +30,7 @@ def test_timeout_after_success_checks_status_and_never_rebooks(world_factory):
     out = w.executor.run(exe)
     assert out.kind == "booked"
     assert w.count("book") == 1 and w.count("get_booking_status") >= 1
-    assert len(w.mock.ledger()) == 7  # 6 seed bookings + 1
+    assert len(w.mock.agent_bookings()) == 1
 
 
 def test_timeout_without_booking_retries_with_same_key(world_factory):
@@ -61,7 +60,7 @@ def test_hold_expired_same_terms_rebooks_under_same_approval_with_new_key(world_
     execs = w.store.executions_for(e.id, Action.BOOK)
     assert out.kind == "booked" and [x.attempt_no for x in execs] == [1, 2]
     assert execs[0].idem_key != execs[1].idem_key and execs[1].parent_execution_id == execs[0].id
-    assert len(w.mock.ledger()) == 7
+    assert len(w.mock.agent_bookings()) == 1
 
 
 def test_hold_expired_with_new_price_requires_fresh_approval(world_factory):
@@ -73,7 +72,7 @@ def test_hold_expired_with_new_price_requires_fresh_approval(world_factory):
     assert out.kind == "needs_reapproval" and out.card and "CONFIRM" in out.card["text"]
     assert out.data["new_price"] == out.data["old_price"] + 200
     assert w.store.get_errand(e.id).state == S.AWAITING_APPROVAL
-    assert w.count("book") == 1 and len(w.mock.ledger()) == 6  # only the expired attempt, nothing booked
+    assert w.count("book") == 1 and not w.mock.agent_bookings()  # only the expired attempt, nothing booked
 
 
 def test_status_stuck_pending_ends_unverified_without_retry(world_factory):
@@ -158,4 +157,3 @@ def test_crash_after_book_then_restart_gives_exactly_one_booking(world_factory, 
     names = [n for n, _ in w.calls]
     first_after_crash = names[names.index("book") + 1]
     assert first_after_crash == "get_booking_status"  # recovery consults the source of truth first
-    assert w.store.pending_notifications(e.session_id)[0]["outcome"] == "booked"

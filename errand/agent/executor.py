@@ -28,8 +28,10 @@ ToolCall = Callable[[str, dict], ToolResult]
 MAX_ATTEMPTS = 3          # re-hold chain length for one approval
 
 
-class SimulatedCrash(Exception):
-    """Raised at a configured fault point to simulate the agent process dying."""
+class SimulatedCrash(BaseException):
+    """Raised at a configured fault point to simulate the agent process dying.
+
+    A BaseException (like SystemExit) so that no `except Exception` safety net can swallow it."""
 
 
 class Executor:
@@ -38,7 +40,7 @@ class Executor:
         self.store, self.gate, self.tracer, self.clock, self.call = store, gate, tracer, clock, call
         self.settings = settings or Settings()
         self.limits: Limits = self.settings.limits
-        self.faults = faults or set()
+        self.faults = faults if faults is not None else set()  # may be shared with the caller
         self._handlers = {Action.BOOK: self._book, Action.CANCEL: self._cancel,
                           Action.RESCHEDULE: self._reschedule}
 
@@ -46,8 +48,6 @@ class Executor:
     def run(self, exe: Execution) -> Outcome:
         try:
             return self._handlers[exe.action](exe)
-        except SimulatedCrash:
-            raise
         except Exception as err:  # unexpected tool/agent error: fail closed with a clear outcome
             self.tracer.emit("error", execution_id=exe.id, error=repr(err))
             return self._fail(exe, f"unexpected error: {type(err).__name__}")
@@ -58,13 +58,9 @@ class Executor:
 
     def recheck_unverified(self, exe: Execution) -> Outcome | None:
         """Watcher follow-up for an UNVERIFIED booking. None while the provider still says pending."""
-        s = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
-        status = s.data.get("status") if (s and s.ok) else None
+        s, status = self._status(exe)
         if status == "booked":
-            d = self._draft(exe)
-            return self._done(exe, "booked", {"provider_name": d.provider_name, "slot": d.slot,
-                                              "price": exe.payload["price"], "booking_id": s.data["booking_id"]},
-                              s.data["booking_id"])
+            return self._booked(exe, s.data["booking_id"])
         if status == "not_booked":
             return self._fail(exe, "the provider confirmed the booking did not go through")
         return None
@@ -161,17 +157,23 @@ class Executor:
             return self._rehold(exe)
         return self._fail(exe, code)
 
+    def _status(self, exe: Execution) -> tuple[ToolResult | None, str | None]:
+        """The provider's view of this execution's key: (result, booked | not_booked | pending | None)."""
+        s = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
+        return s, s.data.get("status") if (s and s.ok) else None
+
+    def _booked(self, exe: Execution, booking_id: str) -> Outcome:
+        d = self._draft(exe)
+        return self._done(exe, "booked", {"provider_name": d.provider_name, "slot": d.slot,
+                                          "price": exe.payload["price"], "booking_id": booking_id}, booking_id)
+
     def _verify_book(self, exe: Execution) -> Outcome | None:
         """Ask the source of truth. Returns an Outcome, or None to retry with the same key."""
         polls = len(self.limits.status_poll_backoff_s) + 1
         for i in range(polls):
-            s = self._invoke(exe, "get_booking_status", {"idempotency_key": exe.idem_key})
-            status = s.data.get("status") if (s and s.ok) else None
+            s, status = self._status(exe)
             if status == "booked":
-                d = self._draft(exe)
-                booking_id = s.data["booking_id"]
-                return self._done(exe, "booked", {"provider_name": d.provider_name, "slot": d.slot,
-                                                  "price": exe.payload["price"], "booking_id": booking_id}, booking_id)
+                return self._booked(exe, s.data["booking_id"])
             if status == "not_booked":
                 if s.data.get("reason"):  # the provider processed and rejected it
                     return self._book_error(exe, ToolResult.fail(s.data["reason"]))
@@ -201,8 +203,7 @@ class Executor:
             self._move(exe, ExecState.FAILED, S.AWAITING_APPROVAL, "price_changed_on_rehold")
             e = self.store.get_errand(exe.errand_id)
             new_draft = approvals.build_draft(self.store, e, Action.BOOK)
-            _, card = approvals.create(self.store, self.tracer, e, new_draft, self.settings.approval_ttl_s,
-                                      budget=e.request.budget_max)
+            _, card = approvals.create(self.store, self.tracer, e, new_draft, self.settings.approval_ttl_s)
             return Outcome("needs_reapproval", exe.errand_id,
                            {"old_price": draft.price, "new_price": new_draft.price}, card=card)
         # material details unchanged: continue under the same approval with a new attempt and key

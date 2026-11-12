@@ -122,7 +122,7 @@ def create_app(runtime_factory=None, watch: bool = True) -> FastAPI:
 
     @app.post("/api/demo/crash-next")
     def crash_next():
-        rt.crash_next = not rt.crash_next
+        rt.arm_crash(not rt.crash_next)
         rt.tracer.emit("demo", action="crash_next", armed=rt.crash_next)
         return rt.state()
 
