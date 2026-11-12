@@ -1,4 +1,6 @@
 """Orchestrator behaviour that doesn't depend on the scripted policy: limits, gate denials, claims, codes."""
+import json
+
 import pytest
 
 from errand.agent.executor import SimulatedCrash
@@ -16,7 +18,7 @@ class Scripted:
     def __init__(self, *responses):
         self.responses, self.seen = list(responses), []
 
-    def complete(self, messages, tools):
+    def complete(self, messages, tools, time_left_s=None):
         self.seen.append(({t["function"]["name"] for t in tools}, messages))
         r = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         if isinstance(r, Exception):
@@ -202,3 +204,49 @@ def test_going_back_to_a_slot_you_already_hold(tmp_path):
     assert card["kind"] == "card" and card["card"]["draft"]["slot"] == a
     assert not [c for c in sim.tool_calls("hold_slot") if not c["ok"]]
     assert sim.confirm(card)[0]["text"].startswith("Booked:")
+
+
+@pytest.mark.parametrize("said, status", [("Plumber in Koramangala tomorrow", "candidate"),
+                                          ("From now on my area is Koramangala", "active")])
+def test_explicit_memory_needs_a_standing_preference(tmp_path, said, status):
+    """The model's explicit=true is checked: naming an area for one request doesn't replace the stored one."""
+    llm = Scripted(call("propose_memory", key="preferred_area", value="Koramangala", explicit=True),
+                   LLMResponse(text="Noted."))
+    agent, _, tracer = agent_with(tmp_path, llm)
+    agent.handle_user_message(agent.new_session(), said)
+    [m] = agent.memory.current("u1", "preferred_area")
+    assert m.status == status and m.source == ("inferred" if status == "candidate" else "explicit")
+    assert ("downgraded" in tracer.of_type("memory_write")[0]) == (status == "candidate")
+
+
+def test_message_during_an_interrupted_booking_gets_the_status_not_the_llm(tmp_path):
+    """After a crash without a restart the errand is still EXECUTING: the LLM used to be called with no tools."""
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]), faults={"book_returned"})
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    card = sim.say("option 1")[-1]
+    with pytest.raises(SimulatedCrash):
+        sim.confirm(card)
+    calls = len(sim.events("llm_call"))
+    out = sim.say("Did it go through?")
+    assert out[0]["kind"] == "template" and "already working" in out[0]["text"]
+    assert len(sim.events("llm_call")) == calls
+
+
+def test_llm_call_that_would_outlast_the_run_ends_with_the_time_limit(tmp_path):
+    from errand.agent.llm.base import LLMDeadline
+    agent, _, tracer = agent_with(tmp_path, Scripted(LLMDeadline()))
+    out = agent.handle_user_message(agent.new_session(), "plumber")
+    assert "time limit" in out[0]["text"] and tracer.of_type("limit_hit")[0]["limit"] == "wall_clock"
+
+
+def test_outage_notice_never_reaches_the_model_or_comes_back_labelled(tmp_path):
+    """Real run (qwen3.8-27b): after a 429 the model repeated the outage notice from the history, label and all,
+    so the user saw "[template from the system] I'm having trouble reaching my language model…"."""
+    llm = Scripted(LLMError("429", retryable=True),
+                   LLMResponse(text="[template from the system] Which area should I search in?"))
+    agent, _, _ = agent_with(tmp_path, llm)
+    sid = agent.new_session()
+    assert agent.handle_user_message(sid, "plumber")[0]["kind"] == "error"
+    out = agent.handle_user_message(sid, "plumber please")
+    assert out[0]["text"] == "Which area should I search in?"
+    assert "trouble reaching" not in json.dumps(llm.seen[-1][1])

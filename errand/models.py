@@ -59,6 +59,7 @@ class MemoryStatus(StrEnum):
     CONFIRMED = "confirmed"
     SUPERSEDED = "superseded"
     FORGOTTEN = "forgotten"
+    REJECTED = "rejected"            # an inference the user said no to
 
 
 class ToolError(BaseModel):

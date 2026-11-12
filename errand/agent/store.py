@@ -85,9 +85,21 @@ class Store:
         return self._errand(row) if row else None
 
     def active_errand(self, session_id: str) -> Errand | None:
+        """The open errand a chat message belongs to. One the user started wins over a proactive rebook the
+        watcher opened meanwhile (the rebook's card is still confirmable by its code)."""
         states = [str(s) for s in OPEN_STATES]
         row = self.db.one(f"SELECT * FROM errands WHERE session_id=? AND state IN ({_placeholders(states)}) "
-                          "ORDER BY rowid DESC LIMIT 1", session_id, *states)
+                          "ORDER BY kind='rebook', rowid DESC LIMIT 1", session_id, *states)
+        return self._errand(row) if row else None
+
+    def unconfirmed_booking(self, user_id: str, service: str | None) -> Errand | None:
+        """An UNVERIFIED booking for this service that the watcher is still checking with the provider."""
+        row = self.db.one(
+            "SELECT e.* FROM errands e JOIN executions x ON x.errand_id = e.id "
+            "LEFT JOIN watcher_jobs j ON j.errand_id = e.id AND j.kind = 'unverified' "
+            "WHERE e.user_id=? AND json_extract(e.request_json, '$.service') IS ? AND x.action='book' "
+            "AND x.state=? AND COALESCE(j.status, 'open') = 'open' LIMIT 1",
+            user_id, service, ExecState.UNVERIFIED)
         return self._errand(row) if row else None
 
     def save_errand(self, e: Errand) -> Errand:
@@ -304,11 +316,6 @@ class Store:
     def add_notification(self, session_id: str, payload: dict[str, Any]) -> None:
         self.db.conn.execute("INSERT INTO notifications VALUES (?,?,?,0,?)",
                              (new_id("n"), session_id, json.dumps(payload), self._now()))
-
-    def pending_notifications(self, session_id: str) -> list[dict[str, Any]]:
-        rows = self.db.all("SELECT * FROM notifications WHERE session_id=? AND delivered=0 ORDER BY rowid",
-                           session_id)
-        return [json.loads(r["payload_json"]) for r in rows]
 
     def take_notifications(self, session_id: str) -> list[dict[str, Any]]:
         """Pending notifications, marked delivered. A no-op read when nothing is pending (the common case)."""

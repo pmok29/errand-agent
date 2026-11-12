@@ -21,7 +21,7 @@ service-specific ones, which rank above global ones. Recency only breaks ties wi
 **Regression test.** `tests/unit/test_memory.py::test_request_filling_memories_survive_the_cap`
 seeds the full profile and checks that `preferred_area` and `earliest_time` are selected for every
 service. With the old ranking restored it fails, along with
-`tests/scenarios/test_s6_memory.py::test_24_*` and `::test_21_*`.
+`tests/scenarios/test_must_memory.py::test_24_*` and `::test_21_*`.
 
 ## 2. A dismissed approval card's code came back to life
 
@@ -148,3 +148,93 @@ don't present them as their own words. (`errand/agent/claim_guard.py`, `errand/a
 renders every non-success template, plus the LLM-unavailable and internal-error messages, and checks
 that none reads as a claim. `test_non_claims_pass` gains the exact sentence. Both fail without the
 fix.
+
+## 8. A provider cancellation took over the conversation the user was in
+
+**What broke.** The user had plumber options on screen when the cleaner's provider cancelled. The
+watcher showed a replacement card. The user replied "option 1" (a plumber) and got a *new cleaner
+card*; the plumber errand was left in COMPARING with no way back to it. Nothing was booked, but the
+conversation was lost.
+
+**Why.** `Store.active_errand` returned the newest open errand, and the watcher's rebook errand was
+newer. `_handle` then dismissed the rebook card (any reply without a code does) and fed the plumber
+choice to the rebook errand.
+
+**Fix.** `active_errand` prefers an errand the user started over a proactive rebook. The rebook card
+stays valid and is confirmed by its own code. (`errand/agent/store.py`)
+
+**Regression test.** `tests/scenarios/test_must_proactive.py::test_30_provider_cancel_does_not_hijack_the_open_errand`.
+
+## 9. "Actually, cancel my cleaner instead" was a dead end
+
+**What broke.** After a plumber search, any request to cancel or reschedule something else failed with
+*"the kind of errand can only change before searching; start a new request"*, and there was no way to
+start one: every later message went to the same errand until a limit aborted it.
+
+**Why.** `update_request` refused a kind change after GATHERING (correctly: a book errand's holds and
+options mean nothing to a cancel), but nothing closed the old errand, and the agent loop was pinned to
+one errand id.
+
+**Fix.** A kind change after GATHERING closes the errand (FAILED, `replaced_by_new_request:<id>`,
+pending cards invalidated) and records the request on a new one; the loop follows the switch. No new
+state was needed: nothing can have run, because no tools exist from AWAITING_APPROVAL on.
+(`errand/agent/internal_tools.py`, `errand/agent/orchestrator.py`)
+
+**Regression test.** `tests/scenarios/test_must_conversation.py::test_31_switching_errand_kind_starts_a_new_request`.
+
+## 10. The 6,000-token budget wasn't a cap
+
+**What broke.** A long user message produced contexts of ~13,000 estimated tokens. Fixing that by
+cutting the message *last* then exposed a second problem: the builder first dropped every memory to
+make room, including `preferred_area`, so the agent asked for the area again.
+
+**Why.** The shrink loop only knew how to drop memories and trim tool outputs; when those ran out it
+gave up. The latest message was always kept whole.
+
+**Fix.** The latest message is cut to a quarter of the budget up front, then memories and tool outputs
+go, then more of the message, until it fits. `context_sent` logs `latest_message_chars_cut` and
+`over_budget`. (`errand/agent/context.py`)
+
+**Regression test.** `tests/scenarios/test_must_memory.py::test_33_long_message_is_cut_to_the_budget`.
+
+## 11. Asking again while a booking was UNVERIFIED booked twice
+
+**What broke.** `book` timed out after succeeding and the status stayed `pending`, so the errand was
+UNVERIFIED. The user repeated the request, picked an option and confirmed: two QuickFix bookings.
+
+**Why.** UNVERIFIED isn't an open state, so the next message started a fresh errand, and the
+duplicate-booking guard only looks within one errand.
+
+**Fix.** The gate denies `hold_slot` for a service while a booking for it is UNVERIFIED and the
+watcher is still re-checking it. (`errand/agent/gate.py`, `Store.unconfirmed_booking`)
+
+**Regression test.** `tests/scenarios/test_must_execution.py::test_32_no_second_booking_while_the_first_is_unverified`.
+
+## 12. "Remember no" erased unrelated text from the history
+
+**What broke.** Declining the inferred `earliest_time: 10:00` removed "10:00" from another provider's
+slot in the options list and from the agent's own question ("earliest time: [removed]").
+
+**Why.** `MemoryStore.confirm(accept=False)` redacted the value like a forgotten fact, although
+`redaction_values` documents that inferences must not be scrubbed because the value can be live data.
+
+**Fix.** A declined inference gets its own `rejected` status: excluded from the memory block, not
+scrubbed. (`errand/agent/memory.py`)
+
+**Regression test.** `tests/unit/test_memory.py::test_rejected_inference_is_kept_out_but_not_scrubbed`.
+
+## 13. The model repeated an outage notice, label and all
+
+**What broke.** In a real run (Groq, `qwen/qwen3.8-27b`) one call hit a 429 and the user got the outage
+notice. On the next turn the model answered with that notice copied from the history, so the user saw
+*"[template from the system] I'm having trouble reaching my language model…"* although the model was
+working.
+
+**Why.** Outage and internal-error notices sat in the history as `template` messages, labelled for the
+model (bug #7). They carry no information for the model, and a model under pressure copies them.
+
+**Fix.** These notices get their own message kind, `error`, which the context builder skips. A
+`[… from the system]` label echoed at the start of model text is stripped.
+(`errand/agent/orchestrator.py`, `errand/agent/context.py`)
+
+**Regression test.** `tests/unit/test_orchestrator.py::test_outage_notice_never_reaches_the_model_or_comes_back_labelled`.

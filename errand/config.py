@@ -42,7 +42,6 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
     "groq": ProviderPreset("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", "GROQ_API_KEY"),
     # 4b, not 8b: dev machine is an M1 with 8 GB RAM
     "ollama": ProviderPreset("http://localhost:11434/v1", "qwen3:4b", None),
-    "openrouter": ProviderPreset("https://openrouter.ai/api/v1", "", "OPENROUTER_API_KEY"),
 }
 
 # Estimated list prices, USD per 1M tokens (input, output). Estimates only; verify before quoting.

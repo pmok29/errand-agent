@@ -51,7 +51,8 @@ def render(o: Outcome) -> str:
         case "already_processing":
             return "I'm already working on that confirmation. I won't submit it twice."
         case "approval_expired":
-            return "That confirmation code has expired. Nothing was booked. I'll show you the current details again."
+            return ("That confirmation code has expired, so nothing was booked. Tell me if you still want it "
+                    "and I'll hold the slot again and show you a fresh confirmation.")
         case "approval_changed":
             return "The details changed since that code was issued (provider, slot or price), so it no longer applies. Nothing was booked."
         case "awaiting":
@@ -95,6 +96,8 @@ def for_state(store: Store, e: Errand) -> Outcome:
             return Outcome("awaiting", e.id, {"code": pending[-1].code})
     if e.state == ErrandState.FAILED:
         last = store.executions_for(e.id)
+        if not last:  # closed before anything ran, e.g. replaced by a new request
+            return Outcome("nothing_yet", e.id)
         return Outcome("failed", e.id, {"reason": last[-1].last_error if last else "unexpected error"})
     return Outcome("nothing_yet", e.id)
 

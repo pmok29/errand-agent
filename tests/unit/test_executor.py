@@ -4,7 +4,6 @@ import pytest
 
 from errand.agent import approvals
 from errand.agent.executor import SimulatedCrash
-from errand.agent.recovery import recover
 from errand.agent.state import transition
 from errand.agent.templates import render
 from errand.models import Action, ErrandKind, ErrandState as S, ExecState, ToolResult
@@ -152,7 +151,7 @@ def test_crash_after_book_then_restart_gives_exactly_one_booking(world_factory, 
     assert w.store.get_execution(exe.id).state == ExecState.EXECUTING  # write-ahead survived the crash
 
     w.rebuild()  # new process: fresh agent objects, same agent.db and mock.db
-    outcomes = recover(w.executor, w.tracer)
+    outcomes = w.executor.recover_all()
     assert [o.kind for o in outcomes] == ["booked"]
     assert w.bookings_for_hold(exe.payload["hold_id"]) == 1
     names = [n for n, _ in w.calls]

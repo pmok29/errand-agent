@@ -11,10 +11,9 @@ from typing import Any, Callable
 from errand.agent import approvals, claim_guard, context, internal_tools, sanitize
 from errand.agent.executor import Executor
 from errand.agent.gate import Gate, slot_outside_request
-from errand.agent.llm.base import LLMClient, LLMError, ToolCall
+from errand.agent.llm.base import LLMClient, LLMDeadline, LLMError, ToolCall
 from errand.agent.memory import MemoryStore
-from errand.agent.recovery import recover
-from errand.agent.state import transition
+from errand.agent.state import NO_LLM_STATES, transition
 from errand.agent.store import Store
 from errand.agent.templates import Outcome, for_state, render, repeat_confirmation
 from errand.agent.tool_schemas import schemas_for
@@ -28,6 +27,7 @@ LIMIT_STATES = {S.GATHERING, S.COMPARING, S.HOLDING}
 SUCCESS = {"booked", "cancelled", "rescheduled"}
 REMEMBER_RE = re.compile(r"\s*remember\s+(yes|no)\s*[.!]?\s*", re.I)
 MAX_SLOTS_SHOWN = 6
+SYSTEM_LABEL = re.compile(r"^\s*\[\w+ from the system\]\s*")  # context.py's history label, echoed back
 
 LLM_UNAVAILABLE = ("I'm having trouble reaching my language model right now. Nothing was booked or changed; "
                    "please try again in a moment.")
@@ -66,7 +66,7 @@ class Agent:
 
     def recover(self) -> list[Outcome]:
         """Finish in-flight side effects after a restart and tell each user what happened."""
-        outcomes = recover(self.executor, self.tracer)
+        outcomes = self.executor.recover_all()
         for o in outcomes:
             e = self.store.get_errand(o.errand_id)
             try:
@@ -109,7 +109,7 @@ class Agent:
             if e and e.state in (S.EXECUTING, S.VERIFYING, S.DONE, S.UNVERIFIED):
                 # something may have happened at the provider: report the persisted truth, never "nothing changed"
                 return [self.reply(session_id, "template", render(for_state(self.store, e)))]
-            return [self.reply(session_id, "template", INTERNAL_ERROR)]
+            return [self.reply(session_id, "error", INTERNAL_ERROR)]
 
     # ---------- routing ----------
     def _handle(self, session_id: str, text: str) -> list[dict[str, Any]]:
@@ -122,6 +122,8 @@ class Agent:
             return self._confirm(e, code)
         e = self.store.active_errand(session_id) or self.store.create_errand(
             self.store.session_user(session_id), session_id, ErrandKind.BOOK)
+        if e.state in NO_LLM_STATES:  # code is running (or, after a crash, resuming) the side effect
+            return [self.reply(session_id, "template", render(for_state(self.store, e)))]
         if e.state == S.AWAITING_APPROVAL:  # anything other than the code is not approval
             approvals.invalidate_pending(self.store, self.tracer, e, "user_replied_without_code")
             approvals.reopen(self.store, self.tracer, e, "user_replied_without_code")
@@ -150,7 +152,7 @@ class Agent:
         llm_turns = tool_calls = 0
         deadline = self.clock.now() + timedelta(seconds=self.limits.max_wall_seconds)
         while True:
-            e = self.store.get_errand(e.id)
+            e = self._current(e.id)
             if llm_turns >= self.limits.max_llm_turns:
                 return self._limit(e, "llm_turns")
             if tool_calls >= self.limits.max_tool_calls:
@@ -162,10 +164,12 @@ class Agent:
             ctx = context.build(self.store, self.memory, e, turn, self.settings.context, tools)
             self.tracer.emit("context_sent", errand_id=e.id, messages=ctx.messages, **ctx.meta)
             try:
-                resp = self.llm.complete(ctx.messages, tools)
+                resp = self.llm.complete(ctx.messages, tools, (deadline - self.clock.now()).total_seconds())
+            except LLMDeadline:
+                return self._limit(e, "wall_clock")
             except LLMError as err:
                 self.tracer.emit("llm_error", error=str(err), retryable=err.retryable)
-                return [self.reply(e.session_id, "template", LLM_UNAVAILABLE)]
+                return [self.reply(e.session_id, "error", LLM_UNAVAILABLE)]
             llm_turns += 1
             self.tracer.llm_call(resp.model, resp.latency_ms, resp.input_tokens, resp.output_tokens,
                                  text=resp.text, tool_calls=[{"name": c.name, "args": c.args} for c in resp.tool_calls])
@@ -181,10 +185,17 @@ class Agent:
                 if card is not None or tool_calls > self.limits.max_tool_calls:
                     content = sanitize.wrap(c.name, {"ok": False, "error": "skipped"})[0]
                 else:
-                    content, card = self._run_tool(self.store.get_errand(e.id), c)
+                    content, card = self._run_tool(self._current(e.id), c)
                 turn.append({"role": "tool", "tool_call_id": c.id, "content": content})
             if card is not None:
-                return self._card(self.store.get_errand(e.id), resp.text, card)
+                return self._card(self._current(e.id), resp.text, card)
+
+    def _current(self, errand_id: str) -> Errand:
+        """The errand the conversation is on now: follows a switch to a new request made this turn."""
+        e = self.store.get_errand(errand_id)
+        while nxt := e.selected.get("superseded_by"):
+            e = self.store.get_errand(nxt)
+        return e
 
     def _run_tool(self, e: Errand, c: ToolCall) -> tuple[str, dict | None]:
         t0, card = time.perf_counter(), None
@@ -246,11 +257,12 @@ class Agent:
         return {"kind": kind, "text": text, **({"card": card} if card else {})}
 
     def _chat(self, e: Errand, text: str | None) -> dict[str, Any]:
-        e = self.store.get_errand(e.id)
+        e = self._current(e.id)
         if missing := [f for f in e.request.missing(e.kind) if f not in e.asked]:
             e.asked += missing  # the model just asked for these; don't let it ask again
             self.store.save_errand(e)
-        text = self._guard(e, text or "Sorry, could you rephrase that?", render(for_state(self.store, e)))
+        text = SYSTEM_LABEL.sub("", text or "") or "Sorry, could you rephrase that?"
+        text = self._guard(e, text, render(for_state(self.store, e)))
         return self.reply(e.session_id, "chat", text)
 
     def _guard(self, e: Errand, text: str, fallback: str | None) -> str | None:

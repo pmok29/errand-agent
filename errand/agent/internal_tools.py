@@ -13,6 +13,8 @@ from errand.models import Errand, ErrandKind, ErrandState as S, MemorySource, Me
 from errand.tracing.tracer import Tracer
 
 MATERIAL = ("service", "area", "date_range", "time_window", "budget_max", "provider_pref", "booking_id")
+STANDING = re.compile(r"\b(remember|always|usually|never|from now on|going forward|in future|by default|"
+                      r"i prefer|preferred|my \w+(?: \w+)? is)\b", re.I)
 
 
 def _pair(args: dict, a: str, b: str, current: tuple | None, label: str,
@@ -35,13 +37,12 @@ def _pair(args: dict, a: str, b: str, current: tuple | None, label: str,
 
 
 def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+    if args.get("kind") in set(ErrandKind) and args["kind"] != e.kind and e.state != S.GATHERING:
+        return _start_over(store, tracer, e, args)
     req = e.request.model_copy()
     try:
         if "kind" in args:
-            kind = ErrandKind(args["kind"])
-            if kind != e.kind and e.state != S.GATHERING:
-                raise ValueError("the kind of errand can only change before searching; start a new request")
-            e.kind = kind
+            e.kind = ErrandKind(args["kind"])
         for f in ("service", "area", "budget_max", "provider_pref", "booking_id"):
             if f in args:
                 setattr(req, f, args[f])
@@ -77,6 +78,17 @@ def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]
                               state=e.state, changed=changed, **hint)
 
 
+def _start_over(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+    """A different kind of errand mid-flow ("actually, cancel my cleaner instead"): close this one and record
+    the new request on a fresh errand. Nothing has run yet: no tools exist from AWAITING_APPROVAL on."""
+    approvals.invalidate_pending(store, tracer, e, "replaced_by_new_request")
+    new = store.create_errand(e.user_id, e.session_id, ErrandKind(args["kind"]))
+    e.selected["superseded_by"] = new.id
+    store.save_errand(e)
+    transition(store, tracer, e, S.FAILED, f"replaced_by_new_request:{new.id}")
+    return update_request(store, tracer, new, args)
+
+
 def request_approval(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any], ttl_s: int) -> tuple[ToolResult, dict | None]:
     try:
         draft = approvals.build_draft(store, e, approvals.action_for(e.kind), slot=args.get("slot"),
@@ -92,7 +104,8 @@ def _key(raw: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
 
 
-def propose_memory(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+def propose_memory(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, Any],
+                   correcting: bool = False) -> ToolResult:
     key, value, explicit = _key(args.get("key", "")), str(args.get("value", "")).strip(), bool(args.get("explicit"))
     if not key or not value:
         return ToolResult.fail("invalid_arguments", message="key and value are required")
@@ -101,13 +114,18 @@ def propose_memory(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, 
         tracer.emit("memory_rejected", errand_id=e.id, key=key, reason="not_stated_by_user")
         return ToolResult.fail("not_stated_by_user", message="only facts the user stated in this conversation can be remembered")
     scope = args.get("scope") or "global"
+    # The model's explicit=true is only a claim: code checks the user framed it as a standing preference
+    # ("always", "from now on", "my area is …"); otherwise the stated value is an inference to confirm later.
+    downgraded = explicit and not correcting and not STANDING.search(mem.message_text(evidence))
+    explicit = explicit and not downgraded
     if explicit:
         m = mem.correct(e.user_id, key, value, scope, evidence, e.session_id)
     elif any(c.value == value for c in mem.current(e.user_id, key)):
         return ToolResult.success(status="already_known", key=key)
     else:
         m = mem.add(e.user_id, key, value, MemorySource.INFERRED, MemoryStatus.CANDIDATE, scope, evidence, e.session_id)
-    tracer.emit("memory_write", errand_id=e.id, key=key, value=value, source=m.source, status=m.status)
+    tracer.emit("memory_write", errand_id=e.id, key=key, value=value, source=m.source, status=m.status,
+                **({"downgraded": "not_stated_as_a_standing_preference"} if downgraded else {}))
     return ToolResult.success(status=m.status, key=key, source=m.source)
 
 
@@ -126,5 +144,5 @@ def memory_op(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, Any])
         return ToolResult.success(status="forgotten", key=key)
     if op == "correct":
         return propose_memory(mem, tracer, e, {"key": key, "value": args.get("value", ""), "explicit": True,
-                                               "scope": args.get("scope")})
+                                               "scope": args.get("scope")}, correcting=True)
     return ToolResult.fail("invalid_arguments", message="op must be list, correct or forget")

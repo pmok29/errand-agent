@@ -108,7 +108,7 @@ def test_14a_restart_mid_booking(tmp_path, ev):
     assert [o.kind for o in outcomes] == ["booked"]
     after = [c["tool"] for c in sim.tool_calls(actor="executor")]
     assert after[after.index("book") + 1] == "get_booking_status" and after.count("book") == 1
-    [note] = sim.agent.store.pending_notifications(sim.sid)
+    [note] = sim.agent.store.take_notifications(sim.sid)
     assert note["messages"][0]["text"].startswith("Booked:") and len(sim.new_bookings()) == 1
     ev.actual = "crash after book → restart → status by persisted key → booked; 1 booking; notification queued"
     finish(sim, ev, crashes=1)
@@ -147,4 +147,22 @@ def test_17_cancel_503_then_ok(tmp_path, ev):
     assert calls[-1] == "list_bookings"
     assert sim.booking("b-plb-up")["status"] == "cancelled"
     ev.actual = "503 → same-key retry → cancelled; confirmed via list_bookings"
+    finish(sim, ev)
+
+
+@pytest.mark.eval(id="32", title="Asking again while the last booking is unconfirmed", category="stretch",
+                  expected="no second hold or booking while the provider is being re-checked; watcher reports the first")
+def test_32_no_second_booking_while_the_first_is_unverified(tmp_path, ev):
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["timeout_booked", "success"], status_pending_checks=4))
+    sim.say(REQUEST)
+    assert "can't confirm yet" in sim.confirm(sim.say("option 1")[-1])[0]["text"]
+    sim.say(REQUEST)
+    out = sim.say("option 1")
+    assert out[-1]["kind"] != "card" and "still being checked" in out[-1]["text"]
+    assert len([c for c in sim.tool_calls("hold_slot") if c["ok"]]) == 1 and len(sim.new_bookings()) == 1
+    assert sim.tick() == []                                     # schedules the re-check at +30 s
+    sim.clock.advance(31)
+    [note] = sim.tick()
+    assert note["messages"][0]["text"].startswith("Update: Booked:") and len(sim.new_bookings()) == 1
+    ev.actual = "second hold denied while UNVERIFIED; watcher then confirmed the first; 1 booking"
     finish(sim, ev)

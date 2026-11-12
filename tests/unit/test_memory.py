@@ -86,3 +86,17 @@ def test_budget_is_enforced_with_seed_and_long_history(store):
     assert ctx.meta["est_tokens"] <= 6000
     assert ctx.meta["history_dropped"] > 0 and ctx.meta["history_kept"] >= 1
     assert ctx.messages[0]["role"] == "system" and "message 149" in ctx.messages[-5]["content"]
+
+
+def test_rejected_inference_is_kept_out_but_not_scrubbed(store):
+    """'remember no' used to redact the value like a forgotten fact, erasing e.g. every "10:00" slot from history."""
+    mem = MemoryStore(store)
+    sid = store.create_session("u1")
+    store.add_message(sid, "assistant", "3. Ampere Home Care: ₹790, earliest 2026-11-11 10:00")
+    m = mem.add("u1", "earliest_time", "10:00", Src.INFERRED, St.CANDIDATE, evidence_session_id=sid)
+    assert mem.confirm(m.id, accept=False).status == St.REJECTED
+    e = store.create_errand("u1", sid, ErrandKind.BOOK)
+    ctx = context.build(store, mem, e, [])
+    assert "10:00" in ctx.messages[1]["content"] and ctx.meta["redaction_hits"] == 0
+    assert {"key": "earliest_time", "status": "rejected", "reason": "rejected_inference"} in ctx.meta["memories_excluded"]
+    assert not mem.visible("u1") and mem.value("u1", "earliest_time") is None

@@ -53,6 +53,18 @@ class Executor:
         """Recovery after a restart: always consult the source of truth before calling again."""
         return self._guarded(exe, self._handlers[exe.action], exe, verify_first=True)
 
+    def recover_all(self) -> list[Outcome]:
+        """Startup: resume every side effect that was in flight when the process died (the Agent tells the users)."""
+        outcomes = []
+        for exe in self.store.open_executions():
+            self.tracer.emit("recovery_resume", execution_id=exe.id, errand_id=exe.errand_id, action=exe.action,
+                             state=exe.state, idem_key=exe.idem_key)
+            try:
+                outcomes.append(self.resume(exe))
+            except Exception as err:  # keep going: the others still need resuming; this one stays open
+                self.tracer.emit("error", where="recovery", execution_id=exe.id, error=repr(err))
+        return outcomes
+
     def _guarded(self, exe: Execution, fn: Callable[..., Outcome], *args, **kwargs) -> Outcome:
         """Unexpected errors fail closed, but never claim "nothing changed" once the side effect was sent:
         then the outcome is UNVERIFIED and the watcher asks the provider."""

@@ -1,4 +1,4 @@
-"""OpenAI-compatible chat client (Groq, Ollama, OpenRouter) with an optional fallback provider."""
+"""OpenAI-compatible chat client (Groq, Ollama) with an optional fallback provider."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ import re
 import time
 from typing import Any, Callable
 
-from errand.agent.llm.base import LLMError, LLMResponse, ToolCall
+from errand.agent.llm.base import LLMDeadline, LLMError, LLMResponse, ToolCall
 from errand.config import Limits, LLMSettings, llm_settings
 
 THINK = re.compile(r"<think>.*?</think>", re.S)  # qwen3 reasoning blocks
@@ -14,7 +14,9 @@ DURATION_PART = re.compile(r"([\d.]+)(ms|h|m|s)")
 SECONDS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600}
 TRY_AGAIN = re.compile(r"try again in ([\d.hms]+)", re.I)   # Groq puts the daily-limit wait in the message
 MAX_RATE_WAIT_S = 15.0        # per wait
-MAX_RATE_WAIT_TOTAL_S = 40.0  # per call; rate-limit waits don't use up the error retries
+MAX_RATE_WAIT_TOTAL_S = 150.0  # per call; rate-limit waits don't use up the error retries. The run's
+                               # 180 s limit still bounds it (free tier: 7-8k tokens/min, ~3k per call)
+GIVE_UP_HINT_S = 40.0          # a longer "try again in …" is a daily limit: let the fallback answer now
 PERMANENT_STATUS = {401, 403, 404}
 # Groq validates tool arguments server-side and rejects the whole response with a 400.
 TOOL_VALIDATION = re.compile(r"tool call validation failed|tool_use_failed", re.I)
@@ -67,14 +69,26 @@ class OpenAICompatClient:
                             timeout=self.limits.llm_timeout_s, max_retries=0)
         self.client = client
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                 time_left_s: float | None = None) -> LLMResponse:
         import openai
         kwargs: dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0,
                                   **self.settings.options}
         if tools:
             kwargs |= {"tools": tools, "tool_choice": "auto"}
         failures, waited, waits, corrected = 0, 0.0, 0, False
+        stop = None if time_left_s is None else time.monotonic() + time_left_s
+
+        def wait_or_give_up(seconds: float) -> None:  # never sleep past the run's limit
+            if stop is not None and time.monotonic() + seconds >= stop:
+                raise LLMDeadline()
+            self.sleep(seconds)
+
         while True:
+            if stop is not None:
+                if (left := stop - time.monotonic()) <= 0:
+                    raise LLMDeadline()
+                kwargs["timeout"] = min(self.limits.llm_timeout_s, left)
             t0 = time.perf_counter()
             try:
                 resp = self.client.chat.completions.create(**kwargs)
@@ -82,15 +96,15 @@ class OpenAICompatClient:
                 hint = rate_limit_hint(e.response.headers, str(e))
                 wait = max(rate_limit_wait(e.response.headers, waits), 1.0)
                 # a daily limit says "try again in 9m": don't sit out the budget, let the fallback answer now
-                if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > MAX_RATE_WAIT_TOTAL_S:
+                if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > GIVE_UP_HINT_S:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True) from e
                 waited, waits = waited + wait, waits + 1
-                self.sleep(wait)
+                wait_or_give_up(wait)
                 continue
             except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
                 if failures == self.limits.llm_retries:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True) from e
-                self.sleep(2 ** failures)
+                wait_or_give_up(2 ** failures)
                 failures += 1
                 continue
             except openai.APIStatusError as e:  # 4xx other than 429: auth, bad request, unknown model
@@ -119,11 +133,12 @@ class FallbackClient:
     def model(self) -> str:
         return self.active.model
 
-    def complete(self, messages, tools) -> LLMResponse:
+    def complete(self, messages, tools, time_left_s: float | None = None) -> LLMResponse:
+        stop = None if time_left_s is None else time.monotonic() + time_left_s
         try:
-            return self.active.complete(messages, tools)
+            return self.active.complete(messages, tools, time_left_s)
         except LLMError as e:
-            if self.active is self.fallback:
+            if self.active is self.fallback or isinstance(e, LLMDeadline):
                 raise
             if e.permanent:
                 self.active = self.fallback
@@ -131,7 +146,7 @@ class FallbackClient:
                 scope = "switched" if self.active is self.fallback else "this call only"
                 self.on_switch(f"{self.primary.model} failed ({e}); using {self.fallback.model} ({scope})")
             try:
-                return self.fallback.complete(messages, tools)
+                return self.fallback.complete(messages, tools, None if stop is None else stop - time.monotonic())
             except LLMError as fb:
                 raise LLMError(f"{e}; fallback {self.fallback.model}: {fb}", retryable=e.retryable) from fb
 

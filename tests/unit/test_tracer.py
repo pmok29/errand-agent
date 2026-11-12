@@ -1,7 +1,7 @@
 import json
 
 from errand.clock import FrozenClock
-from errand.tracing.cost import estimate
+from errand.tracing.tracer import estimate
 from errand.tracing.tracer import Tracer, sanitize
 
 

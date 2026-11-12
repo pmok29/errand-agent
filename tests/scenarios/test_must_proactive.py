@@ -112,3 +112,20 @@ def test_a_new_users_first_booking_cancellation_is_not_swallowed(tmp_path):
                           "1500, 'confirmed', NULL)")
     sim.mock.trigger_provider_cancel("b-u2")
     assert [n["session_id"] for n in sim.tick()] == [sim.agent.store.latest_session("u2")]
+
+
+@pytest.mark.eval(id="30", title="Provider cancels while the user is mid-booking", category="stretch",
+                  expected="the user's next message stays on their own errand; the replacement card stays valid")
+def test_30_provider_cancel_does_not_hijack_the_open_errand(tmp_path, ev):
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success", "success"]), seed=True)
+    sim.tick()
+    sim.say(REQUEST)
+    sim.mock.trigger_provider_cancel("b-cln-up")
+    rebook = sim.tick()[0]["messages"][-1]
+    plumber = sim.say("option 1")[-1]                      # meant for the plumber options on screen
+    assert plumber["card"]["draft"]["provider_id"].startswith("p-plb-")
+    assert sim.confirm(plumber)[0]["text"].startswith("Booked: QuickFix")
+    assert sim.confirm(rebook)[0]["text"].startswith("Booked: ShineBright")   # its code was never invalidated
+    assert len(sim.new_bookings()) == 2
+    ev.actual = "'option 1' → plumber card on the user's errand; both cards confirmable by their own codes"
+    finish(sim, ev)

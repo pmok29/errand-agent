@@ -8,6 +8,7 @@ what it included, excluded and why, so tests can prove it.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import date, timedelta
 from dataclasses import dataclass, field
@@ -24,7 +25,9 @@ from errand.models import ApprovalStatus, Errand, Memory
 
 SYSTEM_PROMPT = (Path(__file__).parent / "prompts" / "system.md").read_text()
 HISTORY_MAX = 40          # candidate messages from the current session, before budgeting
+CURRENT_SHARE = 0.25      # most of the budget the latest message may take before it is cut
 REMOVED = "[removed]"
+CUT = " …[the rest of this message was cut to fit the context budget]"
 TRIMMED = '<tool_output untrusted="true">{"trimmed": "older tool output dropped to fit the context budget"}</tool_output>'
 
 
@@ -100,6 +103,8 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
 
     history = []
     for m in store.session_messages(e.session_id, limit=HISTORY_MAX):
+        if m["kind"] == "error":  # outage notices tell the model nothing, and models copy them
+            continue
         text, n = scrub(m["content"])
         hits += n
         if m["role"] == "assistant" and m["kind"] != "chat":  # code-written: label it so models don't imitate it
@@ -108,13 +113,26 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
     current, older = history[-1:], history[:-1]   # the latest user message is always kept
     turn = [dict(t) for t in turn]
 
-    # Must-keep parts first; shrink memories, then old tool outputs, if even those don't fit.
-    # Token counts are taken once per message and updated only for what changes.
+    # Must-keep parts first. An oversized latest message is cut to its share up front (so it can't push out
+    # the memories that fill the request), then memories, old tool outputs and, last, more of that message
+    # go until it fits. Token counts are taken once per message and updated only for what changes.
     system = system_message()
     sizes = {"tools": _tokens(tools or []), "system": _tokens([system]), "current": _tokens(current)}
     turn_sizes = [_tokens([t]) for t in turn]
-    trimmed, dropped_memories = 0, []
-    while sum(sizes.values()) + sum(turn_sizes) > cfg.budget_tokens:
+    trimmed, dropped_memories, chars_cut = 0, [], 0
+
+    def cut_current(tokens: int) -> bool:
+        nonlocal current, chars_cut
+        if not (current and (text := current[0]["content"].removesuffix(CUT))):
+            return False
+        keep = max(0, len(text) - math.ceil(tokens * cfg.chars_per_token))
+        current, chars_cut = [{**current[0], "content": text[:keep] + CUT}], chars_cut + len(text) - keep
+        sizes["current"] = _tokens(current)
+        return True
+
+    if (excess := sizes["current"] - cfg.budget_tokens * CURRENT_SHARE) > 0:
+        cut_current(math.ceil(excess))
+    while (over := sum(sizes.values()) + sum(turn_sizes) - cfg.budget_tokens) > 0:
         if memories:
             dropped_memories.append(memories.pop())
             system = system_message()
@@ -122,7 +140,7 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
         elif (i := next((i for i, t in enumerate(turn) if t["role"] == "tool" and t["content"] != TRIMMED), None)) is not None:
             turn[i]["content"], trimmed = TRIMMED, trimmed + 1
             turn_sizes[i] = _tokens([turn[i]])
-        else:
+        elif not cut_current(over):
             break
     used = sum(sizes.values()) + sum(turn_sizes)
     kept: list[dict] = []
@@ -139,5 +157,6 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
             "memories_included": [memory_view(m) for m in memories],
             "memories_excluded": [{"key": m.key, "status": m.status, "reason": r} for m, r in excluded],
             "history_kept": len(kept) + len(current), "history_dropped": len(older) - len(kept),
-            "redaction_hits": hits, "tool_outputs_trimmed": trimmed}
+            "redaction_hits": hits, "tool_outputs_trimmed": trimmed, "latest_message_chars_cut": chars_cut,
+            "over_budget": used > cfg.budget_tokens}
     return Context(messages=messages, meta=meta)

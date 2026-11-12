@@ -164,3 +164,26 @@ def test_daily_limit_gives_up_at_once_instead_of_waiting():
     with pytest.raises(LLMError) as e:
         c.complete([], [])
     assert e.value.retryable and slept == [] and len(sdk.calls) == 1
+
+
+def test_waits_never_run_past_the_runs_time_limit():
+    from errand.agent.llm.base import LLMDeadline
+    headers = {"retry-after": "10"}
+    rate = openai.RateLimitError("slow down", response=httpx.Response(429, request=REQ, headers=headers), body=None)
+    slept = []
+    c, sdk = client(rate, message("ok"), slept=slept)
+    with pytest.raises(LLMDeadline):
+        c.complete([], [], time_left_s=5)
+    assert slept == [] and len(sdk.calls) == 1 and sdk.calls[0]["timeout"] <= 5
+    fb = FallbackClient(client(rate)[0], client(message("never"))[0])
+    with pytest.raises(LLMDeadline):                       # no fallback attempt once time is up
+        fb.complete([], [], time_left_s=5)
+
+
+def test_per_minute_limits_are_waited_out_beyond_40_seconds():
+    """Free tier: 7-8k input tokens/min at ~3k per call, so a turn can need several 15 s waits in a row."""
+    headers = {"retry-after": "15"}
+    rate = openai.RateLimitError("slow down", response=httpx.Response(429, request=REQ, headers=headers), body=None)
+    slept = []
+    c, _ = client(rate, rate, rate, rate, message("ok"), slept=slept)
+    assert c.complete([], []).text == "ok" and sum(slept) == 60

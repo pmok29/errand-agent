@@ -12,7 +12,8 @@ from errand.models import Memory, MemorySource as Src, MemoryStatus as St
 TOKEN = re.compile(r"[a-z]+|\d+")
 IGNORED_TOKENS = {"00"}          # "10:00" should match "10 a.m."
 USABLE = (St.ACTIVE, St.CONFIRMED)
-UNUSABLE_REASON = {St.FORGOTTEN: "forgotten", St.SUPERSEDED: "superseded", St.CANDIDATE: "unconfirmed_inference"}
+UNUSABLE_REASON = {St.FORGOTTEN: "forgotten", St.SUPERSEDED: "superseded", St.CANDIDATE: "unconfirmed_inference",
+                   St.REJECTED: "rejected_inference"}
 # Memories that can fill a request field rank above everything else, whatever their age.
 REQUEST_KEYS = ("preferred_area", "earliest_time", "latest_time")
 SERVICE_REQUEST_KEYS = ("budget_{s}", "preferred_provider_{s}", "{s}_time")
@@ -121,9 +122,8 @@ class MemoryStore:
             with self.db.tx():
                 self._supersede(m)
                 self._set(m.id, status=St.CONFIRMED)
-        else:
-            self._set(m.id, status=St.FORGOTTEN)
-            self._redact(m.user_id, m.value, "rejected_inference")
+        else:  # kept out of the memory block, but not scrubbed: the value may be live data ("10:00" slots)
+            self._set(m.id, status=St.REJECTED)
         return self.get(memory_id)
 
     def _redact(self, user_id: str, value: str, reason: str) -> None:
@@ -141,6 +141,9 @@ class MemoryStore:
             if want <= tokens(r["content"]):
                 return r["id"]
         return None
+
+    def message_text(self, msg_id: str) -> str:
+        return self.db.one("SELECT content FROM messages WHERE id=?", msg_id)["content"]
 
     def _candidates(self, user_id: str, session_id: str, prompted: bool) -> list[Memory]:
         return [m for m in self.all(user_id) if m.status == St.CANDIDATE and bool(m.prompted) == prompted
@@ -174,7 +177,7 @@ class MemoryStore:
     def redaction_values(self, user_id: str) -> list[str]:
         """Forgotten values (all spellings): scrubbed from any history sent to the model.
 
-        Inferred candidates are kept out by select() instead. Scrubbing their values from history
+        Inferred candidates and rejected inferences are kept out by select() instead. Scrubbing them from history
         would also erase live data, e.g. a provider name the user is choosing right now."""
         values = {v for r in self.db.all("SELECT variants_json FROM redactions WHERE user_id=?", user_id)
                   for v in json.loads(r["variants_json"])}

@@ -31,10 +31,19 @@ class LLMError(Exception):
         self.retryable, self.permanent = retryable, permanent
 
 
+class LLMDeadline(LLMError):
+    """The run's wall-clock limit leaves no time for (another) attempt."""
+
+    def __init__(self, message: str = "the run's time limit leaves no time for an LLM call"):
+        super().__init__(message, retryable=False)
+
+
 class LLMClient(Protocol):
     model: str
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse: ...
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                 time_left_s: float | None = None) -> LLMResponse:
+        """`time_left_s`: what remains of the run's wall-clock limit; waits and retries must fit inside it."""
 
 
 def estimate_tokens(text: str, chars_per_token: float = 3.5) -> int:

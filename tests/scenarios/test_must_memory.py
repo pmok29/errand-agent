@@ -84,3 +84,17 @@ def test_24_context_budget(tmp_path, ev):
     peak = max(c["est_tokens"] for c in ctxs)
     ev.actual = f"{len(ctxs)} contexts, peak {peak:,} tokens, ≤ 8 memories; area filled from memory"
     finish(sim, ev)
+
+
+@pytest.mark.eval(id="33", title="Context budget with a very long user message", category="stretch",
+                  expected="every context ≤ 6,000 tokens; the message tail is cut and logged; the request still works")
+def test_33_long_message_is_cut_to_the_budget(tmp_path, ev):
+    sim = seeded(tmp_path)
+    out = sim.say(PLUMBER + " Some background about the leak." * 1200)
+    assert "Which one" in out[-1]["text"]                      # the request at the head survived
+    ctxs = sim.contexts()
+    assert all(c["est_tokens"] <= c["budget"] and not c["over_budget"] for c in ctxs)
+    assert all(c["latest_message_chars_cut"] > 0 for c in ctxs)
+    ev.actual = (f"{len(ctxs)} contexts, peak {max(c['est_tokens'] for c in ctxs):,} tokens; "
+                 f"{ctxs[0]['latest_message_chars_cut']:,} chars cut from the message")
+    finish(sim, ev)

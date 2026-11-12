@@ -53,7 +53,7 @@ class FalseClaimer(ReactivePolicy):
     """Announces success while asking for approval."""
     CLAIM = "Booked ✅ You're all set for tomorrow morning."
 
-    def complete(self, messages, tools) -> LLMResponse:
+    def complete(self, messages, tools, time_left_s=None) -> LLMResponse:
         d = self.decide(observe(messages), {t["function"]["name"] for t in tools})
         return self._respond(messages, d, text=self.CLAIM if isinstance(d, tuple) and d[0] == "request_approval" else None)
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import IO, Any, Callable
 
 from errand.clock import Clock, SystemClock
-from errand.tracing.cost import estimate
+from errand.config import PRICES_USD_PER_MTOK, USD_TO_INR
 
 # \w lookarounds so digit runs inside IDs and hex idempotency keys are never masked
 MAX_EVENTS_IN_MEMORY = 20_000  # the JSONL files hold the full history
@@ -34,6 +34,15 @@ def sanitize(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [sanitize(v) for v in value]
     return value
+
+
+def estimate(model: str, input_tokens: int, output_tokens: int) -> dict | None:
+    """Returns {usd, inr, estimated: True}, or None when the model has no listed price."""
+    price = PRICES_USD_PER_MTOK.get(model)
+    if price is None:
+        return None
+    usd = (input_tokens * price[0] + output_tokens * price[1]) / 1_000_000
+    return {"usd": round(usd, 6), "inr": round(usd * USD_TO_INR, 4), "estimated": True}
 
 
 class Tracer:

@@ -88,3 +88,20 @@ def test_13_repeated_confirmation(tmp_path, ev):
     assert len(sim.tool_calls("book")) == 1
     ev.actual = "1 execution, 1 book call; repeat answered from saved outcome"
     finish(sim, ev)
+
+
+@pytest.mark.eval(id="31", title="Switching to a different errand mid-flow", category="stretch",
+                  expected="'actually, cancel my cleaner' after a search starts a cancel; old card dead; nothing booked")
+def test_31_switching_errand_kind_starts_a_new_request(tmp_path, ev):
+    sim = Sim(tmp_path, seed=True)
+    sim.say(PLUMBER)
+    plumber = sim.say("option 1")[-1]
+    card = sim.say("Actually, cancel my cleaner booking instead.")[-1]
+    assert card["kind"] == "card" and card["card"]["draft"]["action"] == "cancel"
+    assert "no longer applies" in sim.confirm(plumber)[0]["text"]
+    assert sim.confirm(card)[0]["text"].startswith("Cancelled:")
+    states = {r["kind"]: r["state"] for r in sim.agent.store.db.all("SELECT kind, state FROM errands")}
+    assert states == {"book": "FAILED", "cancel": "DONE"} and not sim.new_bookings()
+    assert sim.booking("b-cln-up")["status"] == "cancelled"
+    ev.actual = "plumber errand closed (replaced_by_new_request); cancel card → cancelled; old code rejected; 0 bookings"
+    finish(sim, ev)

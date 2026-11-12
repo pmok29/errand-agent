@@ -176,7 +176,8 @@ class ReactivePolicy:
                            input_tokens=estimate_tokens(json.dumps(messages, ensure_ascii=False)),
                            output_tokens=estimate_tokens(out))
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                 time_left_s: float | None = None) -> LLMResponse:
         return self._respond(messages, self.decide(observe(messages), {t["function"]["name"] for t in tools}))
 
     # ---------- policy ----------

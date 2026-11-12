@@ -2,7 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const NOISE = new Set(["context_sent", "assistant_msg"]);
-const KIND_TAG = { template: "status", notification: "update", card: "approval needed", memory_prompt: "memory" };
+const KIND_TAG = { template: "status", error: "status", notification: "update", card: "approval needed", memory_prompt: "memory" };
 let busy = false;
 let lastSeq = 0;   // the backlog and the live stream can overlap
 
@@ -184,10 +184,10 @@ function setState(s) {
 function renderMemories(list) {
   const groups = { usable: [], candidate: [], forgotten: [] };
   for (const m of list) {
-    const g = m.status === "candidate" ? "candidate" : m.status === "forgotten" ? "forgotten" : "usable";
+    const g = m.status === "candidate" ? "candidate" : ["forgotten", "rejected"].includes(m.status) ? "forgotten" : "usable";
     groups[g].push(m);
   }
-  const titles = { usable: "Used by the agent", candidate: "Inferred, waiting for your confirmation", forgotten: "Forgotten" };
+  const titles = { usable: "Used by the agent", candidate: "Inferred, waiting for your confirmation", forgotten: "Forgotten or declined" };
   const root = $("memories");
   root.replaceChildren();
   for (const [g, items] of Object.entries(groups)) {

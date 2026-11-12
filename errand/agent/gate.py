@@ -81,6 +81,10 @@ class Gate:
                 return Decision(False, "date_range differs from the recorded request; call update_request first")
         elif tool == "hold_slot" and (why := slot_outside_request(e.request, args.get("slot", ""))):
             return Decision(False, why)
+        elif tool == "hold_slot" and (other := self.store.unconfirmed_booking(e.user_id, e.request.service)):
+            return Decision(False, f"an earlier {e.request.service} booking ({other.id}) may already have gone "
+                                   "through and is still being checked with the provider; tell the user to wait "
+                                   "for that update instead of booking again")
         elif tool == "list_bookings" and args.get("user_id") != e.user_id:
             return Decision(False, "list_bookings is only allowed for the current user")
         elif tool == "request_approval":
