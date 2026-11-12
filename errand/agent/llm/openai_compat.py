@@ -12,6 +12,7 @@ from errand.config import Limits, LLMSettings, llm_settings
 THINK = re.compile(r"<think>.*?</think>", re.S)  # qwen3 reasoning blocks
 DURATION_PART = re.compile(r"([\d.]+)(ms|h|m|s)")
 SECONDS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600}
+TRY_AGAIN = re.compile(r"try again in ([\d.hms]+)", re.I)   # Groq puts the daily-limit wait in the message
 MAX_RATE_WAIT_S = 15.0        # per wait
 MAX_RATE_WAIT_TOTAL_S = 40.0  # per call; rate-limit waits don't use up the error retries
 PERMANENT_STATUS = {401, 403, 404}
@@ -19,18 +20,25 @@ PERMANENT_STATUS = {401, 403, 404}
 TOOL_VALIDATION = re.compile(r"tool call validation failed|tool_use_failed", re.I)
 
 
-def rate_limit_wait(headers: Any, attempt: int) -> float:
-    """How long to wait after a 429: the provider's retry-after / token-reset hint, capped."""
-    for name in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
-        raw = (headers or {}).get(name)
+def rate_limit_hint(headers: Any, message: str = "") -> float | None:
+    """The provider's own estimate of when to retry, in seconds (uncapped), if it gave one."""
+    for raw in [*((headers or {}).get(n) for n in ("retry-after", "x-ratelimit-reset-tokens",
+                                                   "x-ratelimit-reset-requests")),
+                m.group(1) if (m := TRY_AGAIN.search(message)) else None]:
         if not raw:
             continue
         try:
-            return min(float(raw), MAX_RATE_WAIT_S)
+            return float(raw)
         except ValueError:
             if parts := DURATION_PART.findall(raw):  # Groq style: "860ms", "4.5s", "2m59.5s"
-                return min(sum(float(n) * SECONDS[u] for n, u in parts), MAX_RATE_WAIT_S)
-    return float(2 ** attempt)
+                return sum(float(n) * SECONDS[u] for n, u in parts)
+    return None
+
+
+def rate_limit_wait(headers: Any, attempt: int) -> float:
+    """How long to wait after a 429: the provider's hint, capped; exponential without one."""
+    hint = rate_limit_hint(headers)
+    return min(hint, MAX_RATE_WAIT_S) if hint is not None else float(2 ** attempt)
 
 
 def parse_message(message: Any, model: str, usage: Any, latency_ms: float) -> LLMResponse:
@@ -71,8 +79,10 @@ class OpenAICompatClient:
             try:
                 resp = self.client.chat.completions.create(**kwargs)
             except openai.RateLimitError as e:
+                hint = rate_limit_hint(e.response.headers, str(e))
                 wait = max(rate_limit_wait(e.response.headers, waits), 1.0)
-                if waited + wait > MAX_RATE_WAIT_TOTAL_S:
+                # a daily limit says "try again in 9m": don't sit out the budget, let the fallback answer now
+                if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > MAX_RATE_WAIT_TOTAL_S:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True) from e
                 waited, waits = waited + wait, waits + 1
                 self.sleep(wait)

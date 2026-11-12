@@ -23,11 +23,12 @@ MAX_EVENTS_IN_MEMORY = 20_000  # the JSONL files hold the full history
 
 PHONE = re.compile(r"(?<![\w+-])(?:\+?91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?![\w-])")
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+ACCOUNT = re.compile(r"\b(org|user|proj)_[A-Za-z0-9]{8,}\b")   # provider account IDs in API error text
 
 
 def sanitize(value: Any) -> Any:
     if isinstance(value, str):
-        return EMAIL.sub("[email]", PHONE.sub("[phone]", value))
+        return ACCOUNT.sub(r"\1_[redacted]", EMAIL.sub("[email]", PHONE.sub("[phone]", value)))
     if isinstance(value, dict):
         return {k: sanitize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

@@ -101,6 +101,18 @@ make eval    # everything, including tests/scenarios, and regenerates evals/resu
   - I7: no payload mismatch; side effects only through the gate
 - **Deterministic**: frozen clock, seeded mock. The table is identical across runs.
 
+## Real-LLM runs
+
+The evals never call a model. Two scripts run the real one against the mock provider (they need a key):
+
+```bash
+make smoke        # the brief's three example requests end to end, with a simulated user; traces in traces/s10/
+make trace-demo   # a booking where `book` times out after succeeding → traces/timeout_after_success.jsonl
+```
+
+`traces/timeout_after_success.jsonl` is committed: the raw trace annotated in `DESIGN.md`. Phone numbers,
+emails and provider account IDs are masked in every trace.
+
 ## How it is built
 
 ```

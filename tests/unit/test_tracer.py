@@ -60,3 +60,9 @@ def test_events_outside_a_run_stay_in_memory(tmp_path):
     t.emit("recovery_resume", execution_id="x1")
     assert t.of_type("recovery_resume")[0]["run_id"] is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_provider_account_ids_are_masked():
+    from errand.tracing.tracer import sanitize
+    msg = "Rate limit reached for model `m` in organization `org_01m77ybpb7ezt8t35s6f9nmgen` service tier"
+    assert "org_[redacted]" in sanitize(msg) and "01m77" not in sanitize(msg)

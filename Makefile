@@ -1,6 +1,6 @@
 PY ?= .venv/bin/python
 
-.PHONY: setup run test eval record trace-demo
+.PHONY: setup run test eval smoke trace-demo
 
 setup:
 	python3 -m venv .venv && $(PY) -m pip install -q -e ".[dev]"
@@ -14,8 +14,8 @@ test:
 eval:
 	$(PY) -m pytest tests -q
 
-record:
-	$(PY) -m pytest tests/scenarios -q --record
-
 trace-demo:
 	$(PY) scripts/trace_demo.py
+
+smoke:
+	$(PY) scripts/smoke_llm.py

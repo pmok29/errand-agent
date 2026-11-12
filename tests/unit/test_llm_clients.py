@@ -154,3 +154,13 @@ def test_fallback_can_be_another_model_on_the_same_provider(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "k")
     s = llm_settings("groq:qwen/qwen3.8-27b", overrides=False)
     assert (s.provider, s.model, s.options) == ("groq", "qwen/qwen3.8-27b", {})
+
+
+def test_daily_limit_gives_up_at_once_instead_of_waiting():
+    msg = "Rate limit reached ... on tokens per day (TPD): Limit 200000. Please try again in 6m13.248s."
+    rate = openai.RateLimitError(msg, response=httpx.Response(429, request=REQ), body=None)
+    slept = []
+    c, sdk = client(rate, message("never"), slept=slept)
+    with pytest.raises(LLMError) as e:
+        c.complete([], [])
+    assert e.value.retryable and slept == [] and len(sdk.calls) == 1
