@@ -6,7 +6,7 @@ setup:
 	python3 -m venv .venv && $(PY) -m pip install -q -e ".[dev]"
 
 run:
-	$(PY) -m uvicorn errand.web.app:app --reload --port 8000
+	$(PY) -m uvicorn --factory errand.web.app:create_app --port 8000
 
 test:
 	$(PY) -m pytest tests/unit -q

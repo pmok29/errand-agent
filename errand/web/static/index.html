@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Errand Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <strong>Errand Agent</strong>
+      <span id="llm" class="chip muted"></span>
+      <span id="clock" class="chip"></span>
+      <span id="errand" class="chip"></span>
+    </div>
+    <div class="controls">
+      <label class="ctl">Scenario
+        <select id="preset"></select>
+      </label>
+      <label class="ctl check"><input type="checkbox" id="seed" checked> seed profile</label>
+      <button id="reset" title="Wipe both databases and start a new session with this scenario">Reset</button>
+      <span class="sep"></span>
+      <button id="cancel" title="The provider cancels an upcoming booking; the watcher picks it up">Provider cancels</button>
+      <button id="advance" title="Move the demo clock forward 10 minutes">+10 min</button>
+      <button id="crash" title="Kill the agent right after the next book call returns">Crash next booking</button>
+      <button id="restart" title="New agent process over the same databases; runs recovery">Restart agent</button>
+      <button id="memToggle">Memory</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="pane chat">
+      <div id="banner" class="banner" hidden></div>
+      <div id="log" class="log" aria-live="polite"></div>
+      <form id="composer" class="composer">
+        <input id="text" autocomplete="off" placeholder="e.g. Find a plumber for my kitchen tap this week, mornings, under ₹1,500">
+        <button type="submit" class="primary">Send</button>
+      </form>
+    </section>
+
+    <section class="pane trace">
+      <div class="trace-head">
+        <strong>Trace</strong>
+        <label class="ctl check"><input type="checkbox" id="hideNoise" checked> hide context, echoes &amp; watcher polls</label>
+        <button id="clearTrace" class="small">Clear</button>
+      </div>
+      <div id="trace" class="trace-log"></div>
+    </section>
+
+    <aside id="drawer" class="drawer" hidden>
+      <div class="drawer-head">
+        <strong>Memory</strong>
+        <button id="memClose" class="small">Close</button>
+      </div>
+      <p class="muted small-text">What the agent stores about you. Only <em>explicit</em> and <em>confirmed</em> facts
+        reach the model; candidates wait for your yes. Forgetting scrubs the value from every later context.</p>
+      <div id="memories"></div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

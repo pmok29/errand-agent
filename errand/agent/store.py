@@ -305,3 +305,10 @@ class Store:
         rows = self.db.all("SELECT * FROM notifications WHERE session_id=? AND delivered=0 ORDER BY rowid",
                            session_id)
         return [json.loads(r["payload_json"]) for r in rows]
+
+    def take_notifications(self, session_id: str) -> list[dict[str, Any]]:
+        """Pending notifications, marked delivered."""
+        with self.db.tx():
+            out = self.pending_notifications(session_id)
+            self.db.conn.execute("UPDATE notifications SET delivered=1 WHERE session_id=?", (session_id,))
+        return out
