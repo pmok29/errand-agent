@@ -93,9 +93,9 @@ class Store:
 
     def save_errand(self, e: Errand) -> Errand:
         cur = self.db.conn.execute(
-            "UPDATE errands SET state=?, request_json=?, asked_json=?, selected_json=?, booking_id=?, "
+            "UPDATE errands SET kind=?, state=?, request_json=?, asked_json=?, selected_json=?, booking_id=?, "
             "updated_at=?, version=version+1 WHERE id=? AND version=?",
-            (e.state, e.request.model_dump_json(), json.dumps(e.asked), json.dumps(e.selected),
+            (e.kind, e.state, e.request.model_dump_json(), json.dumps(e.asked), json.dumps(e.selected),
              e.booking_id, self._now(), e.id, e.version))
         if cur.rowcount != 1:
             raise StaleErrand(e.id)

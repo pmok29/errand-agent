@@ -11,13 +11,16 @@ _DONE = r"(booked|cancel+ed|rescheduled|confirmed|moved)"
 CLAIM = re.compile(
     r"✅|^\s*" + _DONE + r"\b|"
     r"\b(i'?ve|i have|i)\s+(just\s+|successfully\s+)?" + _DONE + r"\b|"
-    r"\b(is|are|has been|have been|was|been|now)\s+(successfully\s+)?" + _DONE + r"\b|"
+    r"(\b(is|are|has been|have been|was|been|now)|'s)\s+(successfully\s+)?" + _DONE + r"\b|"
     r"\bbooking (is )?confirmed\b|\bsuccessfully " + _DONE + r"\b|"
     r"\b(you'?re|you are) (all )?set\b|\ball (set|done)\b", re.I)
 # Questions, negations, conditionals and future tense are not claims of a completed outcome.
+# "after/before/when/once/until" hedge only when a clause follows ("after you confirm"), not a time
+# ("confirmed for after 10am" is still a claim).
 HEDGE = re.compile(
-    r"\b(not|n't|never|no longer|yet|will|would|shall|should|once|after|if|when|until|can|could|"
-    r"want|like me|before|to be|pending|waiting|haven'?t|hasn'?t)\b|\?", re.I)
+    r"\b(not|n't|never|no longer|yet|will|would|shall|should|if|can|could|"
+    r"want|like me|to be|pending|waiting|haven'?t|hasn'?t)\b|"
+    r"\b(once|after|before|when|until)\b(?!\s+(\d|noon|midday|midnight|lunch))|\?", re.I)
 SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
 
 

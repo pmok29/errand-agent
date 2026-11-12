@@ -22,3 +22,66 @@ service-specific ones, which rank above global ones. Recency only breaks ties wi
 seeds the full profile and checks that `preferred_area` and `earliest_time` are selected for every
 service. With the old ranking restored it fails, along with
 `tests/scenarios/test_s6_memory.py::test_24_*` and `::test_21_*`.
+
+## 2. A dismissed approval card's code came back to life
+
+**What broke.** The user got a card, replied "yeah ok" instead of the code, and the agent showed the
+card again. That part is correct: anything other than the exact code is not approval. But the
+re-shown card had the *same* code as the dismissed one, so the old code still worked. It surfaced
+when the dismissed card started going back to the still-valid hold (HOLDING) rather than COMPARING:
+`test_reply_without_code_is_not_approval` expected the stale code to be rejected and got
+`Booked: PipeDoctor …` instead.
+
+**Why.** `code_for(hash)` derived the 4-character code from the draft hash alone. Same provider,
+slot and price meant the same hash, so every re-issue of identical terms produced the same code. An
+invalidated code then matched the new pending approval. "This code belongs to this card" was never
+actually enforced. Nothing was booked on terms the user hadn't seen, but a code typed from an old,
+dismissed message must not count as approval.
+
+**Fix.** The code is now `base32(sha256(hash | approval_id))[:4]`, so each card has its own code.
+The hash is unchanged and still drives the material-change check. (`errand/agent/approvals.py`)
+
+**Regression tests.** `tests/unit/test_core.py::test_reissued_card_with_same_terms_gets_a_new_code`
+re-issues identical terms and checks that the old code is rejected as `invalidated`.
+`tests/unit/test_orchestrator.py::test_reply_without_code_is_not_approval` covers the same path
+through the full agent. Both fail with the unsalted code restored.
+
+## 3. "Cancel my plumber booking" stayed a booking
+
+**What broke.** Writing the cancel and reschedule scenarios (#15, #17), "Cancel my plumber booking"
+made the agent ask *"Which area should I search in? Which day works?"*: the questions for a new
+booking. The model had called `update_request(kind="cancel", service="plumber")` correctly, and the
+call returned ok.
+
+**Why.** `Store.save_errand` updated state, request, asked fields and selections, but not `kind`.
+`update_request` changed `e.kind` in memory and saved it, the save silently dropped it, and the next
+turn reloaded the errand as a `book`. So the missing-details list, the allowed actions
+(`request_approval` must match the kind) and the card type were all wrong. Every errand starts as a
+`book` until the first message is understood, so no cancel or reschedule could ever work through chat.
+Earlier tests built cancel and reschedule errands directly with `create_errand(kind=…)` and never
+exercised the change.
+
+**Fix.** `save_errand` now writes `kind`. (`errand/agent/store.py`)
+
+**Regression test.** `tests/unit/test_orchestrator.py::test_change_of_errand_kind_is_persisted`.
+Scenarios #15 and #17 also fail without the fix.
+
+## 4. A stale confirmation code broke the card that replaced it
+
+**What broke.** In scenario #8, the user got a card, changed the time, and got a new card. They then
+typed the *old* code: it was correctly rejected ("no longer applies"). But typing the *new* code
+afterwards returned "Something went wrong on my side". Nothing was booked: it failed closed, but
+the user could not complete a valid approval.
+
+**Why.** `_confirm` moved any errand in AWAITING_APPROVAL to COMPARING whenever the code it was
+given was invalidated, expired or changed. That is right when the code belongs to the card on
+screen, but here the code was from an earlier card while a newer one was still pending. The errand
+left AWAITING_APPROVAL with a live approval. Consuming that approval then tried COMPARING → EXECUTING,
+an illegal transition, and the exception surfaced as the generic error.
+
+**Fix.** If a newer approval is still pending, a stale code leaves the state alone. The reply says
+the old code no longer applies and repeats the current one. The state only moves back when no pending
+approval remains. (`errand/agent/orchestrator.py`)
+
+**Regression test.** `tests/unit/test_orchestrator.py::test_stale_code_keeps_the_newer_card_open`.
+Scenario #8 also fails without the fix.

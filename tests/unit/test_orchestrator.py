@@ -95,3 +95,27 @@ def test_repeated_code_after_success_does_not_rebook(tmp_path):
     assert agent.handle_user_message(sid, f"CONFIRM {code}")[0]["text"].startswith("Booked:")
     again = agent.handle_user_message(sid, f"CONFIRM {code}")
     assert again[0]["text"].startswith("That's already done") and len(mock.ledger()) == 7
+
+
+def test_change_of_errand_kind_is_persisted(tmp_path):
+    """Bug #3: save_errand didn't write `kind`, so 'cancel my plumber booking' stayed a booking."""
+    agent, _, tracer = agent_with(tmp_path, ReactivePolicy())
+    sid = agent.new_session()
+    agent.handle_user_message(sid, "Cancel my plumber booking")
+    e = agent.store.latest_errand(sid)
+    assert e.kind == "cancel" and e.request.booking_id == "b-plb-up"
+    assert "area" not in tracer.of_type("assistant_msg")[-1]["text"].lower()
+
+
+def test_stale_code_keeps_the_newer_card_open(tmp_path):
+    """Bug #4: an old code moved the errand out of AWAITING_APPROVAL, so the current card's code then failed."""
+    agent, mock, _ = agent_with(tmp_path, ReactivePolicy(), book_outcomes=["success"])
+    sid = agent.new_session()
+    agent.handle_user_message(sid, "Plumber in Indiranagar this week, mornings, under 1500")
+    old = agent.handle_user_message(sid, "option 1")[-1]["card"]
+    new = agent.handle_user_message(sid, "option 2")[-1]["card"]
+    stale = agent.handle_user_message(sid, f"CONFIRM {old['code']}")[0]["text"]
+    assert "no longer applies" in stale and f"CONFIRM {new['code']}" in stale
+    assert agent.store.latest_errand(sid).state == S.AWAITING_APPROVAL
+    assert agent.handle_user_message(sid, f"CONFIRM {new['code']}")[0]["text"].startswith("Booked:")
+    assert sum(1 for b in mock.ledger() if b["hold_id"]) == 1

@@ -6,6 +6,7 @@ which is built only from persisted records (hold quote, seen booking), never fro
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -73,8 +74,9 @@ def draft_hash(draft: ApprovalDraft) -> str:
     return payload_hash(draft.model_dump(mode="json"))
 
 
-def code_for(hash: str) -> str:
-    return base64.b32encode(bytes.fromhex(hash))[:4].decode()
+def code_for(hash: str, approval_id: str) -> str:
+    """Short code for one card. Salted with the approval id, so a re-shown card never revives an old code."""
+    return base64.b32encode(hashlib.sha256(f"{hash}|{approval_id}".encode()).digest())[:4].decode()
 
 
 def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> dict:
@@ -108,7 +110,8 @@ def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, t
     if draft.action == Action.BOOK:
         expires = min(expires, datetime.fromisoformat(store.latest_hold(errand.id).expires_at))
     h = draft_hash(draft)
-    a = Approval(id=new_id("a"), errand_id=errand.id, hash=h, code=code_for(h), draft=draft,
+    approval_id = new_id("a")
+    a = Approval(id=approval_id, errand_id=errand.id, hash=h, code=code_for(h, approval_id), draft=draft,
                  status=ApprovalStatus.PENDING, expires_at=expires.isoformat())
     store.insert_approval(a)
     tracer.emit("approval_created", errand_id=errand.id, approval_id=a.id, hash=h, code=a.code,

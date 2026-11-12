@@ -9,7 +9,7 @@ from datetime import timedelta
 from typing import Any, Callable
 
 from errand.agent import approvals, claim_guard, context, internal_tools, sanitize
-from errand.agent.executor import Executor
+from errand.agent.executor import Executor, SimulatedCrash
 from errand.agent.gate import Gate, slot_outside_request
 from errand.agent.llm.base import LLMClient, LLMError, ToolCall
 from errand.agent.memory import MemoryStore
@@ -18,9 +18,9 @@ from errand.agent.state import transition
 from errand.agent.store import Store
 from errand.agent.templates import Outcome, for_state, render, repeat_confirmation
 from errand.agent.tool_schemas import schemas_for
-from errand.clock import Clock
+from errand.clock import Clock, is_expired
 from errand.config import Settings
-from errand.models import Errand, ErrandKind, ErrandState as S, Request, ToolResult, ToolTimeout
+from errand.models import ApprovalStatus, Errand, ErrandKind, ErrandState as S, Request, ToolResult, ToolTimeout
 from errand.tracing.tracer import Tracer
 
 ToolCallFn = Callable[[str, dict], ToolResult]
@@ -75,6 +75,8 @@ class Agent:
         self.store.add_message(e.session_id, "user", f"[Automated notice, not from the user] {notice}", kind="event")
         try:
             return self._llm_loop(e)
+        except SimulatedCrash:
+            raise
         except Exception as err:
             self.tracer.emit("error", error=repr(err))
             return [self._reply(e.session_id, "template", INTERNAL_ERROR)]
@@ -85,6 +87,8 @@ class Agent:
         self.store.add_message(session_id, "user", text)
         try:
             out = self._handle(session_id, text)
+        except SimulatedCrash:  # tests: the process "dies" here; recovery runs in a new Agent
+            raise
         except Exception as err:  # every exit path produces a clear user-facing outcome
             self.tracer.emit("error", error=repr(err))
             out = [self._reply(session_id, "template", INTERNAL_ERROR)]
@@ -105,8 +109,16 @@ class Agent:
             self.store.session_user(session_id), session_id, ErrandKind.BOOK)
         if e.state == S.AWAITING_APPROVAL:  # anything other than the code is not approval
             approvals.invalidate_pending(self.store, self.tracer, e, "user_replied_without_code")
-            transition(self.store, self.tracer, e, S.COMPARING, "user_replied_without_code")
+            transition(self.store, self.tracer, e, self._after_card(e), "user_replied_without_code")
         return self._llm_loop(e)
+
+    def _after_card(self, e: Errand) -> S:
+        """Where a dismissed card leaves the errand: back to the hold if it is still valid."""
+        hold = self.store.latest_hold(e.id)
+        if approvals.action_for(e.kind) == approvals.Action.BOOK and hold \
+                and not is_expired(hold.expires_at, self.clock.now()):
+            return S.HOLDING
+        return S.COMPARING
 
     def _confirm(self, e: Errand, code: str) -> list[dict[str, Any]]:
         res = approvals.consume(self.store, self.tracer, e, code)
@@ -115,10 +127,13 @@ class Agent:
             return self._outcome(e, self.executor.run(res.execution))
         if res.status == "already_consumed":
             return self._outcome(e, repeat_confirmation(self.store, e))
-        if e.state == S.AWAITING_APPROVAL and res.status in ("expired", "changed", "invalidated"):
-            transition(self.store, self.tracer, e, S.COMPARING, f"approval_{res.status}")
         kind = {"expired": "approval_expired", "changed": "approval_changed",
                 "invalidated": "approval_changed"}.get(res.status)
+        if kind and e.state == S.AWAITING_APPROVAL:
+            if self.store.approvals_for(e.id, ApprovalStatus.PENDING):  # an old code; the newer card stays open
+                return [self._reply(e.session_id, "template",
+                                    f"{render(Outcome(kind, e.id))} {render(for_state(self.store, e))}")]
+            transition(self.store, self.tracer, e, S.COMPARING, f"approval_{res.status}")
         if kind:
             return self._outcome(e, Outcome(kind, e.id))
         return [self._reply(e.session_id, "template", "That code doesn't match anything waiting for confirmation. "
@@ -238,6 +253,8 @@ class Agent:
         out = []
         if preface and claim_guard.allowed(preface, e.state):
             out.append(self._reply(e.session_id, "chat", preface))
+        elif preface:  # the card itself is the truthful status
+            self.tracer.emit("claim_blocked", errand_id=e.id, state=e.state, original=preface, replacement=card["text"])
         out.append(self._reply(e.session_id, "card", card["text"], card))
         return out
 

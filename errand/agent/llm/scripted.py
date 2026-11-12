@@ -23,6 +23,8 @@ SERVICE_WORDS = [(r"plumb|\btap\b|leak|pipe|drain", "plumber"), (r"electric|wiri
                  (r"\bac\b|air ?con", "ac_servicing"), (r"clean", "cleaner")]
 TIME_WORDS = {"morning": ("06:00", "12:00"), "afternoon": ("12:00", "17:00"), "evening": ("17:00", "21:00")}
 ORDINALS = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}
+AFFIRM = re.compile(r"\s*(yes|yeah|yep|ok|okay|sure|go ahead|fine|sounds good)\b", re.I)
+CLOCK_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)|\b(\d{1,2}):(\d{2})\b", re.I)
 ASK = {"service": "What do you need done (plumber, electrician, AC servicing or cleaning)?",
        "area": "Which area should I search in: Indiranagar, Koramangala or HSR Layout?",
        "date_range": "Which day or dates work for you?",
@@ -108,6 +110,24 @@ def parse_choice(text: str) -> int | None:
     return None
 
 
+def parse_time(text: str) -> str | None:
+    """A clock time the user named ("11am", "2:30 pm", "14:00") as HH:MM."""
+    if not (m := CLOCK_RE.search(text)):
+        return None
+    if m.group(3):
+        return _hour(m.group(1), m.group(3))[:3] + (m.group(2) or "00")
+    return f"{int(m.group(4)):02d}:{m.group(5)}"
+
+
+def pick_slot(text: str, slots: list[str]) -> str | None:
+    """The slot the user chose by number or by time."""
+    if (i := parse_choice(text)) is not None and slots:
+        return slots[min(i, len(slots) - 1)]
+    if t := parse_time(text):
+        return next((s for s in slots if s[11:16] == t), None)
+    return None
+
+
 @dataclass
 class Observation:
     state: dict[str, Any]
@@ -179,11 +199,53 @@ class ReactivePolicy:
                 and "propose_memory" in tools and "propose_memory" not in done_names:
             # a time limit stated for this request might be a standing preference: an inference to confirm later
             return ("propose_memory", {"key": "earliest_time", "value": _hour(m.group(1), m.group(2)), "explicit": False})
+        kind = s["errand"]["kind"]
+        if kind in ("reschedule", "cancel") and "booking_id" in s["missing"]:
+            return self._find_booking(obs, tools, done_names)
         if s["missing"]:
             return " ".join(ASK.get(f, f"What is the {f}?") for f in s["missing"])
-        if s["errand"]["kind"] in ("book", "rebook"):
+        if kind in ("book", "rebook"):
             return self._book(obs, tools, done_names)
-        return "Rescheduling and cancelling are handled in a later build of this policy."
+        return self._change_booking(obs, tools, done_names, remembered)
+
+    # ---------- cancel / reschedule ----------
+    @staticmethod
+    def _find_booking(obs: Observation, tools: set[str], done_names: list[str]) -> str | tuple[str, dict]:
+        s = obs.state
+        if not s["bookings"] and "list_bookings" in tools and "list_bookings" not in done_names:
+            return ("list_bookings", {"user_id": s["user_id"]})
+        service = s["request"].get("service")
+        upcoming = [b for b in s["bookings"] if b["status"] == "confirmed" and b["slot"][:10] >= s["now"][:10]
+                    and (service is None or b["service"] == service)]
+        if len(upcoming) == 1 and "update_request" in tools:
+            return ("update_request", {"booking_id": upcoming[0]["id"]})
+        if not upcoming:
+            return "I couldn't find an upcoming booking that matches. Which booking do you mean?"
+        return "Which booking do you mean? " + "; ".join(
+            f"{b['provider_name']} ({b['service'].replace('_', ' ')}) on {b['slot'].replace('T', ' ')}" for b in upcoming)
+
+    def _change_booking(self, obs: Observation, tools: set[str], done_names: list[str],
+                        remembered: dict[str, str]) -> str | tuple[str, dict]:
+        s, r = obs.state, obs.state["request"]
+        if s["errand"]["kind"] == "cancel":
+            return ("request_approval", {"action": "cancel", "booking_id": r["booking_id"]})
+        booking = next(b for b in s["bookings"] if b["id"] == r["booking_id"])
+        mine = next((o for o in s["options"] if o["provider_id"] == booking["provider_id"]), None)
+        if mine is None:
+            if "search_providers" in done_names:
+                return f"{booking['provider_name']} has no free slots on those dates. Want to try other days?"
+            area = r.get("area") or remembered.get("preferred_area")
+            if area is None:  # the provider's own service areas
+                if "get_provider" not in done_names:
+                    return ("get_provider", {"provider_id": booking["provider_id"]})
+                area = (obs.last_result or {}).get("data", {}).get("areas", [None])[0]
+            return ("search_providers", {"service": booking["service"], "area": area, "date_range": r["date_range"]})
+        if (slot := pick_slot(obs.user, mine["slots"])) and "request_approval" not in done_names:
+            return ("request_approval", {"action": "reschedule", "booking_id": booking["id"], "slot": slot})
+        if not mine["slots"]:
+            return f"{booking['provider_name']} has no free slots that fit. Want to try other days or times?"
+        lines = [f"{i}. {slot.replace('T', ' ')}" for i, slot in enumerate(mine["slots"], start=1)]
+        return f"{booking['provider_name']} can come at:\n" + "\n".join(lines) + "\nWhich time works?"
 
     @staticmethod
     def _memory_reply(cmd: dict, result: dict) -> str:
@@ -201,8 +263,22 @@ class ReactivePolicy:
         s = obs.state
         options = s["options"]
         viable = [o for o in options if o["within_budget"] and o["slots"]]
-        if s["errand"]["state"] == "HOLDING" and s["hold"] and "hold_slot" in done_names:
+        hold = s["hold"]
+        if s["errand"]["state"] == "HOLDING" and hold and "hold_slot" in done_names:
+            data = (obs.last_result or {}).get("data", {})
+            if data.get("over_budget") and not auto_pick:  # ask before showing a card above the budget
+                return (f"The provider now quotes ₹{hold['quoted_price']:,} (search showed ₹{hold['search_price']:,}), "
+                        f"above your ₹{s['request']['budget_max']:,} budget. Should I go ahead at that price?")
             return ("request_approval", {"action": "book"})
+        if s["errand"]["state"] == "HOLDING" and hold and AFFIRM.match(obs.user):
+            return ("request_approval", {"action": "book"})
+        if hold and (t := parse_time(obs.user)) and "hold_slot" in tools and "hold_slot" not in done_names:
+            # a different time with the provider already held
+            held = next((o for o in options if o["provider_id"] == hold["provider_id"]), {"slots": []})
+            slot = next((x for x in held["slots"] if x[11:16] == t and x != hold["slot"]), None)
+            if slot is None:
+                return f"{t} isn't available with that provider. Pick another time?"
+            return ("hold_slot", {"provider_id": hold["provider_id"], "slot": slot})
         choice = 0 if auto_pick and "search_providers" in done_names else parse_choice(obs.user)
         if choice is not None and viable and "hold_slot" in tools and "hold_slot" not in done_names:
             pick = viable[min(choice, len(viable) - 1)]

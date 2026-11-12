@@ -68,6 +68,18 @@ def test_repeated_code_does_not_create_second_execution(world_factory):
     assert len(w.store.executions_for(e.id)) == 1
 
 
+def test_reissued_card_with_same_terms_gets_a_new_code(world_factory):
+    """Bug #2: the code came from the draft hash alone, so a dismissed card's code revived on re-issue."""
+    w = world_factory()
+    e = w.errand()
+    w.hold(e)
+    old, _ = w.approve(e)
+    new, card = w.approve(w.store.get_errand(e.id))  # same hold, same terms: identical draft hash
+    assert new.hash == old.hash and new.code != old.code and new.code in card["text"]
+    assert w.store.approvals_for(e.id)[0].status == ApprovalStatus.INVALIDATED
+    assert approvals.consume(w.store, w.tracer, w.store.get_errand(e.id), old.code).status == "invalidated"
+
+
 def test_material_change_invalidates_approval(world_factory):
     w = world_factory()
     e = w.errand()
@@ -161,6 +173,7 @@ def test_side_effect_with_wrong_key_or_payload_is_denied(world_factory):
     "Your plumber is booked for Thursday.", "Your booking is confirmed.", "I have cancelled your booking.",
     "Your AC service has been rescheduled to Saturday.", "You're all set for Thursday.",
     "Done! I successfully booked it.", "The appointment was moved to Saturday.",
+    "Your plumber is confirmed for after 10am.", "It's booked for before noon on Friday.",
 ])
 def test_claims_are_detected(text):
     assert claim_guard.claims_outcome(text)
