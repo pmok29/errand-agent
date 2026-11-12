@@ -93,7 +93,6 @@ class Paths:
     agent_db: Path = ROOT / "agent.db"
     mock_db: Path = ROOT / "mock.db"
     traces: Path = ROOT / "traces"
-    cassettes: Path = ROOT / "cassettes"
     evals: Path = ROOT / "evals"
 
 
