@@ -256,3 +256,27 @@ now skips the primary until then, logged once as `llm_fallback … for the next 
 
 **Regression tests.** `tests/unit/test_llm_clients.py::test_unparseable_model_output_is_retried_once` and
 `::test_daily_limit_skips_the_primary_until_it_resets`.
+
+## 15. Users had to deal with a confirmation code the button already covered (user-facing)
+
+**What broke.** Every card ended "Reply CONFIRM 2QE6 to go ahead" and showed the code under its
+Confirm button. In testing, the first question about the UI was "what's this number?". The button
+itself only typed `CONFIRM 2QE6` into the chat for you, so the code was redundant for anyone using the
+web UI, and the chat history (which the model reads) was full of codes. The model also received the
+code in the `request_approval` tool result, which invited it to repeat it to the user.
+
+**Why.** The code was designed for chat-only channels, where it binds the approval to one card. The
+web UI was then built on top of the text channel instead of having its own action.
+
+**Fix.** The Confirm button posts the card's approval id to `/api/approve` (`Agent.approve`), which runs
+the same checks as before: the card belongs to this session, is pending and unexpired, and its
+provider, slot and price still match. Card text, status messages and tool results no longer mention a
+code. The code stays as the card's internal identifier and as a typed fallback for channels without
+buttons (the smoke and trace scripts). Plain "yes" is still not approval. The UI shows "✓ Confirmed"
+as the user's message. (`errand/agent/orchestrator.py`, `errand/agent/approvals.py`,
+`errand/web/app.py`, `errand/web/static/app.js`)
+
+**Regression tests.** `tests/unit/test_orchestrator.py::test_approval_is_a_button_and_no_code_reaches_the_user_or_the_model`,
+`::test_a_card_from_another_session_cannot_be_approved` and
+`tests/unit/test_web.py::test_booking_through_the_confirm_button`. Every eval scenario now confirms
+through the button path (`Sim.confirm`).

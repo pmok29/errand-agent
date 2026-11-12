@@ -200,6 +200,10 @@ class Store:
                           "WHERE e.session_id=? AND a.code=? ORDER BY a.rowid DESC LIMIT 1", session_id, code)
         return self.get_errand(row["errand_id"]) if row else None
 
+    def get_approval(self, approval_id: str) -> Approval | None:
+        row = self.db.one("SELECT * FROM approvals WHERE id=?", approval_id)
+        return self._approval(row) if row else None
+
     def approval_by_code(self, errand_id: str, code: str) -> Approval | None:
         row = self.db.one("SELECT * FROM approvals WHERE errand_id=? AND code=? ORDER BY rowid DESC LIMIT 1",
                           errand_id, code)

@@ -82,18 +82,26 @@ class Agent:
 
     def handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
         with self.lock:
-            return self._handle_user_message(session_id, text)
+            return self._user_step(session_id, "user_message", text, "chat", self._handle, session_id, text)
+
+    def approve(self, session_id: str, approval_id: str) -> list[dict[str, Any]]:
+        """The card's Confirm button. Same checks as a typed code: this session's card, pending, unexpired,
+        details unchanged."""
+        with self.lock:
+            return self._user_step(session_id, "approval", "✓ Confirmed", "approval", self._approve,
+                                   session_id, approval_id, approval_id=approval_id)
 
     def run_proactive(self, e: Errand, notice: str) -> list[dict[str, Any]]:
         """An LLM run started by the system (no user message). The notice is code-authored and marked as such."""
         self.store.add_message(e.session_id, "user", f"[Automated notice, not from the user] {notice}", kind="event")
         return self._safely(e.session_id, self._llm_loop, e)
 
-    def _handle_user_message(self, session_id: str, text: str) -> list[dict[str, Any]]:
-        self.tracer.start_run(session_id, kind="user_message")
-        self.tracer.emit("user_msg", text=text)
-        self.store.add_message(session_id, "user", text)
-        out = self._safely(session_id, self._handle, session_id, text)
+    def _user_step(self, session_id: str, run_kind: str, text: str, msg_kind: str,
+                   fn: Callable[..., list[dict[str, Any]]], *args, **trace: Any) -> list[dict[str, Any]]:
+        self.tracer.start_run(session_id, kind=run_kind)
+        self.tracer.emit("user_msg", text=text, **trace)
+        self.store.add_message(session_id, "user", text, kind=msg_kind)
+        out = self._safely(session_id, fn, *args)
         e = self.store.latest_errand(session_id)
         self.tracer.end_run(outcome=e.state if e else "no_errand", replies=[m["kind"] for m in out])
         return out
@@ -128,6 +136,14 @@ class Agent:
             approvals.invalidate_pending(self.store, self.tracer, e, "user_replied_without_code")
             approvals.reopen(self.store, self.tracer, e, "user_replied_without_code")
         return self._llm_loop(e)
+
+    def _approve(self, session_id: str, approval_id: str) -> list[dict[str, Any]]:
+        a = self.store.get_approval(approval_id)
+        e = self.store.get_errand(a.errand_id) if a else None
+        if e is None or e.session_id != session_id:  # never another session's card
+            return [self.reply(session_id, "template", "That card isn't part of this conversation, so nothing was "
+                                                       "booked or changed.")]
+        return self._confirm(e, a.code)
 
     def _confirm(self, e: Errand, code: str) -> list[dict[str, Any]]:
         res = approvals.consume(self.store, self.tracer, e, code)

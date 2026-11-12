@@ -64,6 +64,13 @@ class Sim:
         return next(r for r in reversed(self.replies) if r["kind"] == "card")
 
     def confirm(self, card: dict | None = None) -> list[dict[str, Any]]:
+        """Press the card's Confirm button, as the web UI does."""
+        out = self.agent.approve(self.sid, (card or self.last_card())["card"]["approval_id"])
+        self.replies += out
+        return out
+
+    def type_code(self, card: dict | None = None) -> list[dict[str, Any]]:
+        """The typed fallback for channels without buttons."""
         return self.say(f"CONFIRM {(card or self.last_card())['card']['code']}")
 
     def new_session(self) -> str:

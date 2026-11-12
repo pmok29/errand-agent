@@ -50,8 +50,9 @@ estimates from the price table in `errand/config.py`.
 ## Using the web app
 
 Chat is on the left, the live trace on the right. When the agent wants to act it shows a **card**
-with the exact provider, slot and price, and a code. Click **Confirm**, or type `CONFIRM ABCD`.
-Anything else ("yes", "ok") is not approval.
+with the exact provider, slot and price. Only its **Confirm** button approves those exact details;
+typing "yes" or "ok" is not approval. (Scripts and other channels without buttons can type the card's
+hidden code as `CONFIRM <code>`; the code is in the API response, never in the text.)
 
 Try:
 - `Find a plumber for my kitchen tap this week, mornings only, under ₹1,500.` (the area comes from memory)
@@ -148,5 +149,5 @@ Both are git-ignored except the committed demo trace.
   offline scenario for it yet.
 - One demo user (`u1`) and one session at a time in the web app; no authentication.
 - While the user has their own errand open, chat goes to it; a proactive replacement card is answered
-  by its code (or by chatting once the user's errand is finished).
+  with its own Confirm button (or by chatting once the user's errand is finished).
 - LLM prices are list-price estimates.

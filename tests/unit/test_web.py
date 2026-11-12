@@ -34,15 +34,18 @@ def test_index_and_state(web):
     assert s["now"].startswith("Tue 10 Nov 09:0")
 
 
-def test_booking_through_the_api_with_card_code_in_history(web):
+def test_booking_through_the_confirm_button(web):
     client, rt, published = web
     chat(client, REQUEST)
     card = chat(client, "option 1")["replies"][-1]
-    assert card["kind"] == "card"
+    assert card["kind"] == "card" and "CONFIRM" not in card["text"]
     history = client.get("/api/state").json()["history"]
     assert history[-1]["card"] == card["card"]                        # live reply and reload give the same card
-    out = chat(client, f"CONFIRM {card['card']['code']}")
+    r = client.post("/api/approve", json={"approval_id": card["card"]["approval_id"]})
+    out = r.json()
     assert out["replies"][0]["text"].startswith("Booked:") and out["state"]["errand"]["state"] == "DONE"
+    after = client.get("/api/state").json()["history"]
+    assert after[-2] == {"role": "user", "kind": "approval", "text": "✓ Confirmed"}   # what reload shows
     traced = [m["event"]["type"] for m in published if m["channel"] == "trace"]
     assert {"tool_call", "gate_decision", "context_sent", "approval_consumed"} <= set(traced)
 

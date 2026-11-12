@@ -51,12 +51,12 @@ def render(o: Outcome) -> str:
         case "already_processing":
             return "I'm already working on that confirmation. I won't submit it twice."
         case "approval_expired":
-            return ("That confirmation code has expired, so nothing was booked. Tell me if you still want it "
+            return ("That confirmation has expired, so nothing was booked. Tell me if you still want it "
                     "and I'll hold the slot again and show you a fresh confirmation.")
         case "approval_changed":
-            return "The details changed since that code was issued (provider, slot or price), so it no longer applies. Nothing was booked."
+            return "The details changed since that card was shown (provider, slot or price), so it no longer applies. Nothing was booked."
         case "awaiting":
-            return f"Waiting for your confirmation. Reply CONFIRM {d['code']} to go ahead, or tell me what to change."
+            return "Waiting for your confirmation: press Confirm on the latest card, or tell me what to change."
         case "provider_cancelled":
             return (f"Heads up: {d['provider_name']} cancelled your {d['service'].replace('_', ' ')} booking on "
                     f"{slot}. I'm looking for a replacement that fits your preferences.")
@@ -93,7 +93,7 @@ def for_state(store: Store, e: Errand) -> Outcome:
     if e.state == ErrandState.AWAITING_APPROVAL:
         pending = store.approvals_for(e.id, ApprovalStatus.PENDING)
         if pending:
-            return Outcome("awaiting", e.id, {"code": pending[-1].code})
+            return Outcome("awaiting", e.id)
     if e.state == ErrandState.FAILED:
         last = store.executions_for(e.id)
         if not last:  # closed before anything ran, e.g. replaced by a new request

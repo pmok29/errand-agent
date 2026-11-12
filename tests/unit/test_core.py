@@ -37,7 +37,8 @@ def test_card_and_hash_come_from_the_hold_quote(world_factory):
     hold = w.hold(e)
     a, card = w.approve(e)
     assert a.draft.price == hold.data["quoted_price"]
-    assert f"₹{hold.data['quoted_price']:,}" in card["text"] and a.code in card["text"]
+    assert f"₹{hold.data['quoted_price']:,}" in card["text"] and card["approval_id"] == a.id
+    assert a.code not in card["text"] and "CONFIRM" not in card["text"]   # approval is the button, not a code
     assert a.hash == approvals.draft_hash(a.draft)
 
 
@@ -75,7 +76,7 @@ def test_reissued_card_with_same_terms_gets_a_new_code(world_factory):
     w.hold(e)
     old, _ = w.approve(e)
     new, card = w.approve(w.store.get_errand(e.id))  # same hold, same terms: identical draft hash
-    assert new.hash == old.hash and new.code != old.code and new.code in card["text"]
+    assert new.hash == old.hash and new.code != old.code and card["approval_id"] == new.id
     assert w.store.approvals_for(e.id)[0].status == ApprovalStatus.INVALIDATED
     assert approvals.consume(w.store, w.tracer, w.store.get_errand(e.id), old.code).status == "invalidated"
 

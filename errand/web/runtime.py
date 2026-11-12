@@ -132,8 +132,15 @@ class Runtime:
     # ---------- chat ----------
     @serialized
     def say(self, text: str) -> dict[str, Any]:
+        return self._step(self.agent.handle_user_message, text)
+
+    @serialized
+    def approve(self, approval_id: str) -> dict[str, Any]:
+        return self._step(self.agent.approve, approval_id)
+
+    def _step(self, fn: Callable[[str, str], list[dict]], arg: str) -> dict[str, Any]:
         try:
-            replies = self.agent.handle_user_message(self.session_id, text)
+            replies = fn(self.session_id, arg)
         except SimulatedCrash:
             self.tracer.emit("demo", action="crashed", point=CRASH_POINT)
             return {"replies": [], "crashed": True}

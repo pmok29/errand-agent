@@ -21,7 +21,8 @@ mid-flow closes the old one (FAILED, `replaced_by_new_request`).
 
 **Approval enforcement.** `request_approval` builds an `ApprovalDraft` from persisted records (the hold's
 quote, or a booking seen in `list_bookings`), never from model arguments; card and hash both derive from
-it. Only an exact `CONFIRM <code>` (regex, in code) approves, and each card has its own code. One
+it. Only the card's Confirm button approves: it posts that card's approval id, checked in code (scripts
+without buttons type its hidden code, `CONFIRM <code>`). Typed "yes" is never approval. One
 transaction recomputes the draft (changed provider, slot or price → rejected), consumes the approval,
 writes the write-ahead execution and enters EXECUTING. Approvals expire with the hold; any other reply
 dismisses the card.
@@ -57,7 +58,7 @@ real-LLM runs.
 ```
  18 tool_call         get_provider(p-plb-03) + injection_flagged   ← planted review never reaches the model
  53 approval_created  code FRPX (QuickFix, Tue 10 Nov 10:00, ₹1,150: from the hold record)
- 59 user_msg          "CONFIRM FRPX"                    ← matched in code; no LLM call from here on
+ 59 user_msg          "CONFIRM FRPX"                    ← script's typed fallback for the button; no LLM call from here on
  60 state_transition  AWAITING_APPROVAL → EXECUTING     ← approval consumed + write-ahead row, one tx
  63 tool_call         book(h-2b8ec3bd, key 1a4b3c6b…) → TIMEOUT
  64 state_transition  EXECUTING → VERIFYING             ← never retry blind: ask the source of truth

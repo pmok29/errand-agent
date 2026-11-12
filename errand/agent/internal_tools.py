@@ -97,7 +97,7 @@ def request_approval(store: Store, tracer: Tracer, e: Errand, args: dict[str, An
         return ToolResult.fail("cannot_request_approval", message=str(err)), None
     _, card = approvals.create(store, tracer, e, draft, ttl_s)
     transition(store, tracer, e, S.AWAITING_APPROVAL, "approval_requested")
-    return ToolResult.success(status="shown_to_user", code=card["code"]), card
+    return ToolResult.success(status="shown_to_user", next_step="the user confirms with the card's button"), card
 
 
 def _key(raw: str) -> str:

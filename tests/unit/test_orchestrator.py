@@ -114,10 +114,11 @@ def test_stale_code_keeps_the_newer_card_open(tmp_path):
     agent.handle_user_message(sid, "Plumber in Indiranagar this week, mornings, under 1500")
     old = agent.handle_user_message(sid, "option 1")[-1]["card"]
     new = agent.handle_user_message(sid, "option 2")[-1]["card"]
-    stale = agent.handle_user_message(sid, f"CONFIRM {old['code']}")[0]["text"]
-    assert "no longer applies" in stale and f"CONFIRM {new['code']}" in stale
+    stale = agent.approve(sid, old["approval_id"])[0]["text"]          # the old card's button
+    assert "no longer applies" in stale and "press Confirm on the latest card" in stale
     assert agent.store.latest_errand(sid).state == S.AWAITING_APPROVAL
-    assert agent.handle_user_message(sid, f"CONFIRM {new['code']}")[0]["text"].startswith("Booked:")
+    assert agent.handle_user_message(sid, f"CONFIRM {old['code']}")[0]["text"].startswith("The details changed")
+    assert agent.approve(sid, new["approval_id"])[0]["text"].startswith("Booked:")
     assert len(mock.agent_bookings()) == 1
 
 
@@ -250,3 +251,28 @@ def test_outage_notice_never_reaches_the_model_or_comes_back_labelled(tmp_path):
     out = agent.handle_user_message(sid, "plumber please")
     assert out[0]["text"] == "Which area should I search in?"
     assert "trouble reaching" not in json.dumps(llm.seen[-1][1])
+
+
+def test_approval_is_a_button_and_no_code_reaches_the_user_or_the_model(tmp_path):
+    """User-facing: cards used to say "Reply CONFIRM 2QE6" and the button just typed that into the chat."""
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]))
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    card = sim.say("option 1")[-1]
+    code = card["card"]["code"]
+    assert code not in card["text"] and "CONFIRM" not in card["text"] and card["card"]["approval_id"]
+    assert sim.say("yes")[-1]["kind"] == "card"                     # still not approval: the card is re-shown
+    out = sim.confirm()
+    assert out[0]["text"].startswith("Booked:") and len(sim.new_bookings()) == 1
+    assert sim.agent.approve(sim.sid, sim.last_card()["card"]["approval_id"])[0]["text"].startswith("That's already done")
+    seen = json.dumps([c["messages"] for c in sim.contexts()])
+    assert all(c["card"]["code"] not in seen for c in sim.replies if c.get("card") and "code" in c["card"])
+    assert [m["kind"] for m in sim.agent.store.session_messages(sim.sid)].count("approval") == 2   # both presses
+
+
+def test_a_card_from_another_session_cannot_be_approved(tmp_path):
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]))
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    card = sim.say("option 1")[-1]
+    other = sim.agent.new_session()
+    assert "isn't part of this conversation" in sim.agent.approve(other, card["card"]["approval_id"])[0]["text"]
+    assert not sim.new_bookings()

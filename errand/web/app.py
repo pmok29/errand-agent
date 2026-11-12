@@ -29,6 +29,10 @@ class Message(BaseModel):
     text: str
 
 
+class Approve(BaseModel):
+    approval_id: str
+
+
 class Reset(BaseModel):
     preset: str = "normal"
     seed: bool = True
@@ -95,6 +99,10 @@ def create_app(runtime_factory=None, watch: bool = True) -> FastAPI:
         if not m.text.strip():
             raise HTTPException(400, "empty message")
         return {**rt.say(m.text.strip()), "state": rt.state()}
+
+    @app.post("/api/approve")
+    def approve(a: Approve):
+        return {**rt.approve(a.approval_id), "state": rt.state()}
 
     @app.get("/api/memories")
     def memories():

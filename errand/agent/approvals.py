@@ -1,5 +1,8 @@
 """Approval drafts, hashes, confirmation codes, code-rendered cards, and consumption.
 
+The user approves with the card's Confirm button (its approval id). The code identifies the card
+internally and is the typed fallback (`CONFIRM <code>`) for channels without buttons; it is never shown.
+
 The card the user sees and the hash the gate checks are both derived from one ApprovalDraft,
 which is built only from persisted records (hold quote, seen booking), never from LLM arguments.
 """
@@ -83,7 +86,7 @@ def over_budget(price: int | None, budget: int | None) -> bool:
     return price is not None and budget is not None and price > budget
 
 
-def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> dict:
+def render_card(draft: ApprovalDraft, approval_id: str, code: str, budget: int | None = None) -> dict:
     over = over_budget(draft.price, budget)
     if draft.action == Action.BOOK:
         line = f"Book {draft.provider_name} on {fmt_slot(draft.slot)} for {fmt_money(draft.price)}"
@@ -94,8 +97,9 @@ def render_card(draft: ApprovalDraft, code: str, budget: int | None = None) -> d
     else:
         line = (f"Move your {draft.provider_name} booking from {fmt_slot(draft.old_slot)} "
                 f"to {fmt_slot(draft.slot)}")
-    text = f"{line}. Reply CONFIRM {code} to go ahead, or tell me what to change."
-    return {"kind": "card", "text": text, "code": code, "draft": draft.model_dump(mode="json"),
+    text = f"{line}. Press Confirm to go ahead, or tell me what to change."
+    return {"kind": "card", "text": text, "approval_id": approval_id, "code": code,
+            "draft": draft.model_dump(mode="json"),
             "over_budget": over}
 
 
@@ -119,7 +123,7 @@ def create(store: Store, tracer: Tracer, errand: Errand, draft: ApprovalDraft, t
     store.insert_approval(a)
     tracer.emit("approval_created", errand_id=errand.id, approval_id=a.id, hash=h, code=a.code,
                 draft=draft.model_dump(mode="json"), expires_at=a.expires_at)
-    return a, render_card(draft, a.code, errand.request.budget_max)
+    return a, render_card(draft, a.id, a.code, errand.request.budget_max)
 
 
 def invalidate_pending(store: Store, tracer: Tracer, errand: Errand, reason: str) -> None:

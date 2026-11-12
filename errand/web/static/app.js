@@ -28,19 +28,17 @@ function addMessage(m) {
     div.appendChild(tag);
   }
   div.appendChild(document.createTextNode(m.text));
-  const cardCode = kind === "card" && m.card && m.card.code;
-  if (cardCode) {
-    retireCards();  // only the newest card can be confirmed from the UI; older codes are rejected server-side anyway
+  const approvalId = kind === "card" && m.card && m.card.approval_id;
+  if (approvalId) {
+    retireCards();  // only the newest card can be confirmed from the UI; older cards are rejected server-side anyway
     const row = document.createElement("div");
     row.className = "card-actions";
     const btn = document.createElement("button");
     btn.className = "primary";
-    btn.textContent = `Confirm`;
-    btn.title = `Sends "CONFIRM ${cardCode}"`;
-    btn.onclick = () => { btn.disabled = true; send(`CONFIRM ${cardCode}`); };
-    const code = document.createElement("code");
-    code.textContent = `CONFIRM ${cardCode}`;
-    row.append(btn, code);
+    btn.textContent = "Confirm";
+    btn.title = "Approve exactly these details";
+    btn.onclick = () => { btn.disabled = true; approve(approvalId); };
+    row.append(btn);
     div.appendChild(row);
   }
   if (kind === "memory_prompt") {
@@ -67,12 +65,21 @@ function systemNote(text) {
 }
 
 async function send(text) {
-  if (busy || !text.trim()) return;
-  busy = true;
+  if (!text.trim()) return;
   $("text").value = "";
-  addMessage({ role: "user", kind: "chat", text });
+  await step({ role: "user", kind: "chat", text }, "/api/message", { text });
+}
+
+function approve(approvalId) {
+  return step({ role: "user", kind: "approval", text: "✓ Confirmed" }, "/api/approve", { approval_id: approvalId });
+}
+
+async function step(shown, path, body) {
+  if (busy) return;
+  busy = true;
+  addMessage(shown);
   try {
-    const r = await api("/api/message", { text });
+    const r = await api(path, body);
     r.replies.forEach(addMessage);
     if (r.crashed) showBanner("The agent process crashed right after the provider answered the book call. Click “Restart agent” to recover.");
     setState(r.state);

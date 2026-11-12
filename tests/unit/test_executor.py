@@ -69,7 +69,7 @@ def test_hold_expired_with_new_price_requires_fresh_approval(world_factory):
     w.clock.advance(601)
     w.mock.scenario.price_drift = {"p-plb-01": 200}
     out = w.executor.run(exe)
-    assert out.kind == "needs_reapproval" and out.card and "CONFIRM" in out.card["text"]
+    assert out.kind == "needs_reapproval" and out.card and out.card["approval_id"]
     assert out.data["new_price"] == out.data["old_price"] + 200
     assert w.store.get_errand(e.id).state == S.AWAITING_APPROVAL
     assert w.count("book") == 1 and not w.mock.agent_bookings()  # only the expired attempt, nothing booked

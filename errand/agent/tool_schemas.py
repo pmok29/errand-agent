@@ -45,7 +45,7 @@ SCHEMAS: dict[str, dict] = {
         []),
     "request_approval": _fn(
         "request_approval", "Ask the user to confirm a booking, cancellation or reschedule. The system shows "
-        "the exact details and a confirmation code; you never perform the action yourself.",
+        "the exact details with a Confirm button; you never perform the action yourself.",
         {"action": {"type": "string", "enum": ["book", "cancel", "reschedule"]},
          "slot": {"type": "string", "description": "new slot, for reschedule"},
          "booking_id": {"type": "string", "description": "for cancel / reschedule"}},
