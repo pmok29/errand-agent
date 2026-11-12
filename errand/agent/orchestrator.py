@@ -143,10 +143,10 @@ class Agent:
         if e is None or e.session_id != session_id:  # never another session's card
             return [self.reply(session_id, "template", "That card isn't part of this conversation, so nothing was "
                                                        "booked or changed.")]
-        return self._confirm(e, a.code)
+        return self._confirm(e, approval_id=approval_id)
 
-    def _confirm(self, e: Errand, code: str) -> list[dict[str, Any]]:
-        res = approvals.consume(self.store, self.tracer, e, code)
+    def _confirm(self, e: Errand, code: str | None = None, approval_id: str | None = None) -> list[dict[str, Any]]:
+        res = approvals.consume(self.store, self.tracer, e, code, approval_id)
         e = self.store.get_errand(e.id)
         if res.status == "ok":
             return self._outcome(e, self.executor.run(res.execution))

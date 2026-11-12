@@ -130,7 +130,8 @@ def build(store: Store, mem: MemoryStore, e: Errand, turn: list[dict[str, Any]],
         sizes["current"] = _tokens(current)
         return True
 
-    if (excess := sizes["current"] - cfg.budget_tokens * CURRENT_SHARE) > 0:
+    over_budget = sum(sizes.values()) + sum(turn_sizes) > cfg.budget_tokens
+    if over_budget and (excess := sizes["current"] - cfg.budget_tokens * CURRENT_SHARE) > 0:
         cut_current(math.ceil(excess))
     while (over := sum(sizes.values()) + sum(turn_sizes) - cfg.budget_tokens) > 0:
         if memories:

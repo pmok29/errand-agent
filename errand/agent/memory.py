@@ -131,19 +131,20 @@ class MemoryStore:
                              (user_id, value, json.dumps(variants(value)), reason, self.store._now()))
 
     # ---------- proposals from the model ----------
-    def stated_by_user(self, session_id: str, value: str) -> str | None:
-        """Provenance: the id of a user message in this session that states `value`, if any."""
+    def stated_by_user(self, session_id: str, value: str, cue: re.Pattern | None = None) -> str | None:
+        """Provenance: the id of the latest user message in this session that states `value` (and, with `cue`,
+        also matches it, e.g. a standing-preference phrase), if any."""
         want = tokens(value)
         if not want:
             return None
         for r in self.db.all("SELECT id, content FROM messages WHERE session_id=? AND role='user' ORDER BY rowid DESC",
                              session_id):
-            if want <= tokens(r["content"]):
+            if want <= tokens(r["content"]) and (cue is None or cue.search(r["content"])):
                 return r["id"]
         return None
 
-    def message_text(self, msg_id: str) -> str:
-        return self.db.one("SELECT content FROM messages WHERE id=?", msg_id)["content"]
+    def declined(self, user_id: str, key: str, value: str) -> bool:
+        return any(m.key == key and m.value == value and m.status == St.REJECTED for m in self.all(user_id))
 
     def _candidates(self, user_id: str, session_id: str, prompted: bool) -> list[Memory]:
         return [m for m in self.all(user_id) if m.status == St.CANDIDATE and bool(m.prompted) == prompted

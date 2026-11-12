@@ -98,7 +98,7 @@ def for_state(store: Store, e: Errand) -> Outcome:
         last = store.executions_for(e.id)
         if not last:  # closed before anything ran, e.g. replaced by a new request
             return Outcome("nothing_yet", e.id)
-        return Outcome("failed", e.id, {"reason": last[-1].last_error if last else "unexpected error"})
+        return Outcome("failed", e.id, {"reason": last[-1].last_error})
     return Outcome("nothing_yet", e.id)
 
 

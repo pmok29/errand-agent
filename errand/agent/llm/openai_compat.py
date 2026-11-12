@@ -67,6 +67,7 @@ class OpenAICompatClient:
                  on_wait: Callable[[str, float, str], None] | None = None):
         self.settings, self.model, self.limits, self.sleep = settings, settings.model, limits or Limits(), sleep
         self.on_wait = on_wait  # (model, seconds, reason): so a trace shows why a call is slow
+        self.max_rate_wait_s = MAX_RATE_WAIT_TOTAL_S
         if client is None:
             from openai import OpenAI
             client = OpenAI(base_url=settings.base_url, api_key=settings.api_key or "missing",
@@ -102,7 +103,7 @@ class OpenAICompatClient:
                 hint = rate_limit_hint(e.response.headers, str(e))
                 wait = max(rate_limit_wait(e.response.headers, waits), 1.0)
                 # a daily limit says "try again in 9m": don't sit out the budget, let the fallback answer now
-                if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > GIVE_UP_HINT_S:
+                if waited + wait > self.max_rate_wait_s or (hint or 0) > GIVE_UP_HINT_S:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True, retry_after=hint) from e
                 waited, waits = waited + wait, waits + 1
                 wait_or_give_up(wait, "rate limit (tokens per minute)")
@@ -138,14 +139,23 @@ class FallbackClient:
         self.active = primary
         self.primary_back_at = 0.0
 
+    def _skipping_primary(self) -> bool:
+        return self.active is self.primary and self.now() < self.primary_back_at
+
     @property
     def model(self) -> str:
-        return self.active.model
+        return self.fallback.model if self._skipping_primary() else self.active.model
 
     def complete(self, messages, tools, time_left_s: float | None = None) -> LLMResponse:
         stop = None if time_left_s is None else time.monotonic() + time_left_s
-        if self.active is self.primary and self.now() < self.primary_back_at:
-            return self.fallback.complete(messages, tools, time_left_s)   # the primary said when to come back
+        if self._skipping_primary():   # the primary said when to come back
+            try:
+                return self.fallback.complete(messages, tools, time_left_s)
+            except LLMDeadline:
+                raise
+            except LLMError as fb:
+                raise LLMError(f"{self.primary.model} is skipped until its daily limit resets; fallback "
+                               f"{self.fallback.model}: {fb}", retryable=fb.retryable) from fb
         try:
             return self.active.complete(messages, tools, time_left_s)
         except LLMError as e:
@@ -174,5 +184,6 @@ def make_client(provider: str | None = None, limits: Limits | None = None,
     fb = primary_settings.fallback  # "ollama", or e.g. "groq:qwen/qwen3.8-27b" (its own rate-limit bucket)
     if not fb or llm_settings(fb, overrides=False).model == primary_settings.model:
         return primary
+    primary.max_rate_wait_s = MAX_RATE_WAIT_S   # one short wait, then let the fallback's own bucket answer
     return FallbackClient(primary, OpenAICompatClient(llm_settings(fb, overrides=False), limits, on_wait=on_wait),
                           on_switch)

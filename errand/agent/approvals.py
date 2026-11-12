@@ -158,11 +158,13 @@ class ConsumeResult:
     approval: Approval | None = None
 
 
-def consume(store: Store, tracer: Tracer, errand: Errand, code: str) -> ConsumeResult:
-    """Atomically: approval -> consumed, write-ahead execution row inserted, errand -> EXECUTING."""
+def consume(store: Store, tracer: Tracer, errand: Errand, code: str | None = None,
+            approval_id: str | None = None) -> ConsumeResult:
+    """Atomically: approval -> consumed, write-ahead execution row inserted, errand -> EXECUTING.
+    The card is named by its id (the Confirm button) or by its code (typed fallback)."""
     with store.db.tx():
-        a = store.approval_by_code(errand.id, code)
-        if a is None:
+        a = store.get_approval(approval_id) if approval_id else store.approval_by_code(errand.id, code)
+        if a is None or a.errand_id != errand.id:
             return ConsumeResult("no_match")
         if a.status != ApprovalStatus.PENDING:
             return ConsumeResult("already_consumed" if a.status == ApprovalStatus.CONSUMED else str(a.status), approval=a)

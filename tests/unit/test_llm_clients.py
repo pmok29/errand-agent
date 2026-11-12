@@ -224,3 +224,34 @@ def test_rate_limit_waits_are_reported_so_the_trace_explains_the_pause():
     c = OpenAICompatClient(SETTINGS, Limits(), client=FakeSDK(rate, message("ok")), sleep=lambda s: None,
                            on_wait=lambda model, s, why: waits.append((model, s, why)))
     assert c.complete([], []).text == "ok" and waits == [("m", 15.0, "rate limit (tokens per minute)")]
+
+
+def test_with_a_fallback_the_primary_waits_one_round_then_hands_over(monkeypatch):
+    """Review: with a 150 s wait cap the primary could spend the run on per-minute 429s while the fallback idled."""
+    from errand.agent.llm.openai_compat import MAX_RATE_WAIT_S, make_client
+    monkeypatch.setenv("GROQ_API_KEY", "k")
+    monkeypatch.setenv("LLM_FALLBACK", "groq:openai/gpt-oss-20b")
+    fb = make_client("groq")
+    assert fb.primary.max_rate_wait_s == MAX_RATE_WAIT_S and fb.fallback.max_rate_wait_s > MAX_RATE_WAIT_S
+    headers = {"retry-after": "15"}
+    rate = openai.RateLimitError("slow down", response=httpx.Response(429, request=REQ, headers=headers), body=None)
+    slept = []
+    primary, psdk = client(rate, rate, rate, slept=slept)
+    primary.max_rate_wait_s = MAX_RATE_WAIT_S
+    secondary, _ = client(message("fallback answered"))
+    assert FallbackClient(primary, secondary).complete([], []).text == "fallback answered"
+    assert slept == [15.0] and len(psdk.calls) == 2
+
+
+def test_while_the_primary_is_skipped_model_and_errors_name_the_fallback():
+    msg = "Rate limit reached ... on tokens per day (TPD). Please try again in 11m48.48s."
+    daily = openai.RateLimitError(msg, response=httpx.Response(429, request=REQ), body=None)
+    conn = openai.APIConnectionError(request=REQ)
+    primary, _ = client(daily)
+    secondary, _ = client(message("fb"), conn, conn, conn, retries=2)
+    secondary.model = "openai/gpt-oss-20b"
+    fb = FallbackClient(primary, secondary, now=lambda: 1000.0)
+    assert fb.complete([], []).text == "fb" and fb.model == "openai/gpt-oss-20b"
+    with pytest.raises(LLMError) as e:
+        fb.complete([], [])
+    assert "skipped until its daily limit resets" in str(e.value)

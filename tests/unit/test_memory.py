@@ -100,3 +100,50 @@ def test_rejected_inference_is_kept_out_but_not_scrubbed(store):
     assert "10:00" in ctx.messages[1]["content"] and ctx.meta["redaction_hits"] == 0
     assert {"key": "earliest_time", "status": "rejected", "reason": "rejected_inference"} in ctx.meta["memories_excluded"]
     assert not mem.visible("u1") and mem.value("u1", "earliest_time") is None
+
+
+def test_a_long_message_that_fits_is_not_cut(store):
+    """Review: the up-front cut to a quarter of the budget used to apply even when everything fit."""
+    sid = store.create_session("u1")
+    text = "Plumber please. " + "The leak started last week under the sink. " * 150 + "Area: Koramangala, budget 900."
+    store.add_message(sid, "user", text)
+    e = store.create_errand("u1", sid, ErrandKind.BOOK)
+    ctx = context.build(store, MemoryStore(store), e, [])
+    assert ctx.meta["est_tokens"] <= 6000 and ctx.meta["latest_message_chars_cut"] == 0
+    assert "Area: Koramangala, budget 900." in ctx.messages[-1]["content"]
+
+
+def test_a_declined_inference_is_not_proposed_again(store):
+    from errand.agent.internal_tools import propose_memory
+    from errand.tracing.tracer import Tracer
+    mem = MemoryStore(store)
+    sid = store.create_session("u1")
+    store.add_message(sid, "user", "Electrician tomorrow, not before 10:00")
+    e = store.create_errand("u1", sid, ErrandKind.BOOK)
+    args = {"key": "earliest_time", "value": "10:00", "explicit": False}
+    assert propose_memory(mem, Tracer(), e, args).data["status"] == "candidate"
+    mem.confirm(mem.current("u1", "earliest_time")[0].id, accept=False)
+    assert propose_memory(mem, Tracer(), e, args).data["status"] == "declined_by_user"
+    assert mem.next_prompt("u1", sid) is None and not mem.current("u1", "earliest_time")
+
+
+def test_standing_preference_counts_from_any_message_in_the_session(store):
+    from errand.agent.internal_tools import propose_memory
+    from errand.tracing.tracer import Tracer
+    mem = MemoryStore(store)
+    sid = store.create_session("u1")
+    store.add_message(sid, "user", "From now on my area is Indiranagar")
+    store.add_message(sid, "user", "any Indiranagar plumbers tomorrow?")
+    e = store.create_errand("u1", sid, ErrandKind.BOOK)
+    r = propose_memory(mem, Tracer(), e, {"key": "preferred_area", "value": "Indiranagar", "explicit": True})
+    assert r.data["status"] == "active" and r.data["source"] == "explicit"
+
+
+def test_routing_prefers_a_recent_user_errand_but_not_an_abandoned_one(store):
+    sid = store.create_session("u1")
+    mine = store.create_errand("u1", sid, ErrandKind.BOOK)
+    rebook = store.create_errand("u1", sid, ErrandKind.REBOOK)
+    assert store.active_errand(sid).id == mine.id               # in the middle of their own errand
+    store.clock.advance(11 * 60)
+    store.save_errand(store.get_errand(rebook.id))              # the rebook is what the user is looking at now
+    assert store.active_errand(sid).id == rebook.id             # the old errand was abandoned

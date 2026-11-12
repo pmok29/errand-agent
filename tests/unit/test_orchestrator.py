@@ -276,3 +276,27 @@ def test_a_card_from_another_session_cannot_be_approved(tmp_path):
     other = sim.agent.new_session()
     assert "isn't part of this conversation" in sim.agent.approve(other, card["card"]["approval_id"])[0]["text"]
     assert not sim.new_bookings()
+
+
+def test_book_kind_on_a_rebook_errand_is_not_a_new_request(tmp_path):
+    """Review: the schema only offers book/reschedule/cancel, so a model may send kind="book" on a rebook."""
+    from errand.agent import internal_tools
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]), seed=True)
+    sim.tick()
+    sim.mock.trigger_provider_cancel("b-cln-up")
+    sim.tick()
+    rebook = sim.agent.store.active_errand(sim.sid)
+    assert rebook.kind == "rebook"
+    r = internal_tools.update_request(sim.agent.store, sim.tracer, rebook, {"kind": "book", "time_from": "09:00"})
+    after = sim.agent.store.get_errand(rebook.id)
+    assert r.ok and after.kind == "rebook" and after.state != S.FAILED and "superseded_by" not in after.selected
+
+
+def test_a_card_id_from_another_errand_is_no_match(tmp_path):
+    from errand.agent import approvals
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]))
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    card = sim.say("option 1")[-1]
+    other = sim.agent.store.create_errand("u1", sim.sid, "book")
+    res = approvals.consume(sim.agent.store, sim.tracer, other, approval_id=card["card"]["approval_id"])
+    assert res.status == "no_match" and not sim.new_bookings()

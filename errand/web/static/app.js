@@ -37,7 +37,7 @@ function addMessage(m) {
     btn.className = "primary";
     btn.textContent = "Confirm";
     btn.title = "Approve exactly these details";
-    btn.onclick = () => { btn.disabled = true; approve(approvalId); };
+    btn.onclick = () => approve(approvalId, btn);
     row.append(btn);
     div.appendChild(row);
   }
@@ -64,18 +64,22 @@ function systemNote(text) {
   addMessage({ role: "assistant", kind: "system", text });
 }
 
+// Callers check `busy` before touching the composer or a button, so a click during a slow
+// (rate-limited) request is refused visibly instead of being dropped.
 async function send(text) {
-  if (!text.trim()) return;
+  if (busy || !text.trim()) return;
   $("text").value = "";
   await step({ role: "user", kind: "chat", text }, "/api/message", { text });
 }
 
-function approve(approvalId) {
-  return step({ role: "user", kind: "approval", text: "✓ Confirmed" }, "/api/approve", { approval_id: approvalId });
+async function approve(approvalId, btn) {
+  if (busy) return;
+  btn.disabled = true;
+  const ok = await step({ role: "user", kind: "approval", text: "✓ Confirmed" }, "/api/approve", { approval_id: approvalId });
+  if (!ok) btn.disabled = false;   // the request failed: let the user try again
 }
 
 async function step(shown, path, body) {
-  if (busy) return;
   busy = true;
   addMessage(shown);
   try {
@@ -83,8 +87,10 @@ async function step(shown, path, body) {
     r.replies.forEach(addMessage);
     if (r.crashed) showBanner("The agent process crashed right after the provider answered the book call. Click “Restart agent” to recover.");
     setState(r.state);
+    return true;
   } catch (e) {
     systemNote(`Error: ${e.message}`);
+    return false;
   } finally {
     busy = false;
     $("text").focus();

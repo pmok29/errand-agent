@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import Any
 
 from errand.agent.keys import idem_key, payload_hash
@@ -13,6 +14,7 @@ from errand.models import (Action, Approval, ApprovalDraft, ApprovalStatus, Erra
 # Errand states in which the errand is still "in the conversation"
 OPEN_STATES = {ErrandState.GATHERING, ErrandState.COMPARING, ErrandState.HOLDING,
                ErrandState.AWAITING_APPROVAL, ErrandState.EXECUTING, ErrandState.VERIFYING}
+ACTIVE_WINDOW_S = 600     # a user's own errand counts as "in the conversation" this long after it last changed
 # Execution states that block another book on the same errand (the errand guard)
 GUARD_STATES = {ExecState.EXECUTING, ExecState.VERIFYING, ExecState.DONE, ExecState.UNVERIFIED}
 
@@ -85,11 +87,15 @@ class Store:
         return self._errand(row) if row else None
 
     def active_errand(self, session_id: str) -> Errand | None:
-        """The open errand a chat message belongs to. One the user started wins over a proactive rebook the
-        watcher opened meanwhile (the rebook's card is still confirmable by its code)."""
+        """The open errand a chat message belongs to: one the user started and touched recently wins over a
+        proactive rebook the watcher opened meanwhile (whose card stays confirmable by its button); otherwise
+        the newest open errand, so a reply to a rebook doesn't land on an abandoned errand."""
         states = [str(s) for s in OPEN_STATES]
-        row = self.db.one(f"SELECT * FROM errands WHERE session_id=? AND state IN ({_placeholders(states)}) "
-                          "ORDER BY kind='rebook', rowid DESC LIMIT 1", session_id, *states)
+        rows = self.db.all(f"SELECT * FROM errands WHERE session_id=? AND state IN ({_placeholders(states)}) "
+                           "ORDER BY rowid DESC", session_id, *states)
+        recent = (self.clock.now() - timedelta(seconds=ACTIVE_WINDOW_S)).isoformat()
+        mine = [r for r in rows if r["kind"] != "rebook" and r["updated_at"] >= recent]
+        row = (mine or rows or [None])[0]
         return self._errand(row) if row else None
 
     def unconfirmed_booking(self, user_id: str, service: str | None) -> Errand | None:

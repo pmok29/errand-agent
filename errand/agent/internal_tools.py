@@ -37,6 +37,8 @@ def _pair(args: dict, a: str, b: str, current: tuple | None, label: str,
 
 
 def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:
+    if args.get("kind") == ErrandKind.BOOK and e.kind == ErrandKind.REBOOK:
+        args = {k: v for k, v in args.items() if k != "kind"}   # a rebook is a booking: no change of kind
     if args.get("kind") in set(ErrandKind) and args["kind"] != e.kind and e.state != S.GATHERING:
         return _start_over(store, tracer, e, args)
     req = e.request.model_copy()
@@ -116,12 +118,15 @@ def propose_memory(mem: MemoryStore, tracer: Tracer, e: Errand, args: dict[str, 
     scope = args.get("scope") or "global"
     # The model's explicit=true is only a claim: code checks the user framed it as a standing preference
     # ("always", "from now on", "my area is …"); otherwise the stated value is an inference to confirm later.
-    downgraded = explicit and not correcting and not STANDING.search(mem.message_text(evidence))
+    standing = mem.stated_by_user(e.session_id, value, cue=STANDING) if explicit and not correcting else evidence
+    downgraded = explicit and standing is None
     explicit = explicit and not downgraded
     if explicit:
-        m = mem.correct(e.user_id, key, value, scope, evidence, e.session_id)
+        m = mem.correct(e.user_id, key, value, scope, standing, e.session_id)
     elif any(c.value == value for c in mem.current(e.user_id, key)):
         return ToolResult.success(status="already_known", key=key)
+    elif mem.declined(e.user_id, key, value):   # the user already said no to remembering this
+        return ToolResult.success(status="declined_by_user", key=key)
     else:
         m = mem.add(e.user_id, key, value, MemorySource.INFERRED, MemoryStatus.CANDIDATE, scope, evidence, e.session_id)
     tracer.emit("memory_write", errand_id=e.id, key=key, value=value, source=m.source, status=m.status,
