@@ -56,7 +56,8 @@ def run(key: str, provider: str, preset_name: str, out: Path) -> dict:
     scenario = preset(preset_name)
     scenario.book_outcomes = scenario.book_outcomes or ["success"]
     mock = MockProviderService(work / "mock.db", clock, scenario)
-    llm = make_client(provider, Limits(), on_switch=lambda m: tracer.emit("llm_fallback", message=m))
+    llm = make_client(provider, Limits(), on_switch=lambda m: tracer.emit("llm_fallback", message=m),
+                      on_wait=lambda model, s, why: tracer.emit("llm_wait", model=model, seconds=round(s, 1), reason=why))
     agent = build_agent(work / "agent.db", mock, llm, clock, tracer)
     seed_user(agent.store)
     sid = agent.new_session()

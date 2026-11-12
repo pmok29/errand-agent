@@ -214,3 +214,13 @@ def test_daily_limit_skips_the_primary_until_it_resets():
     assert len(psdk.calls) == 1 and len(notes) == 1 and "next 12 min" in notes[0]   # one switch, traced once
     clock[0] += 709
     assert fb.complete([], []).text == "primary is back"
+
+
+def test_rate_limit_waits_are_reported_so_the_trace_explains_the_pause():
+    """Web demo: a 15 s per-minute-limit wait left a silent gap in the trace that looked like a hang."""
+    headers = {"retry-after": "15"}
+    rate = openai.RateLimitError("slow down", response=httpx.Response(429, request=REQ, headers=headers), body=None)
+    waits = []
+    c = OpenAICompatClient(SETTINGS, Limits(), client=FakeSDK(rate, message("ok")), sleep=lambda s: None,
+                           on_wait=lambda model, s, why: waits.append((model, s, why)))
+    assert c.complete([], []).text == "ok" and waits == [("m", 15.0, "rate limit (tokens per minute)")]

@@ -63,8 +63,10 @@ def parse_message(message: Any, model: str, usage: Any, latency_ms: float) -> LL
 
 class OpenAICompatClient:
     def __init__(self, settings: LLMSettings, limits: Limits | None = None, client: Any = None,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 on_wait: Callable[[str, float, str], None] | None = None):
         self.settings, self.model, self.limits, self.sleep = settings, settings.model, limits or Limits(), sleep
+        self.on_wait = on_wait  # (model, seconds, reason): so a trace shows why a call is slow
         if client is None:
             from openai import OpenAI
             client = OpenAI(base_url=settings.base_url, api_key=settings.api_key or "missing",
@@ -81,9 +83,11 @@ class OpenAICompatClient:
         failures, waited, waits, corrected = 0, 0.0, 0, False
         stop = None if time_left_s is None else time.monotonic() + time_left_s
 
-        def wait_or_give_up(seconds: float) -> None:  # never sleep past the run's limit
+        def wait_or_give_up(seconds: float, reason: str) -> None:  # never sleep past the run's limit
             if stop is not None and time.monotonic() + seconds >= stop:
                 raise LLMDeadline()
+            if self.on_wait:
+                self.on_wait(self.model, seconds, reason)
             self.sleep(seconds)
 
         while True:
@@ -101,12 +105,12 @@ class OpenAICompatClient:
                 if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > GIVE_UP_HINT_S:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True, retry_after=hint) from e
                 waited, waits = waited + wait, waits + 1
-                wait_or_give_up(wait)
+                wait_or_give_up(wait, "rate limit (tokens per minute)")
                 continue
             except (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError) as e:
                 if failures == self.limits.llm_retries:
                     raise LLMError(f"{type(e).__name__}: {e}", retryable=True) from e
-                wait_or_give_up(2 ** failures)
+                wait_or_give_up(2 ** failures, f"{type(e).__name__}, retrying")
                 failures += 1
                 continue
             except openai.APIStatusError as e:  # 4xx other than 429: auth, bad request, unknown model
@@ -163,10 +167,12 @@ class FallbackClient:
 
 
 def make_client(provider: str | None = None, limits: Limits | None = None,
-                on_switch: Callable[[str], None] | None = None):
+                on_switch: Callable[[str], None] | None = None,
+                on_wait: Callable[[str, float, str], None] | None = None):
     primary_settings = llm_settings(provider)
-    primary = OpenAICompatClient(primary_settings, limits)
+    primary = OpenAICompatClient(primary_settings, limits, on_wait=on_wait)
     fb = primary_settings.fallback  # "ollama", or e.g. "groq:qwen/qwen3.8-27b" (its own rate-limit bucket)
     if not fb or llm_settings(fb, overrides=False).model == primary_settings.model:
         return primary
-    return FallbackClient(primary, OpenAICompatClient(llm_settings(fb, overrides=False), limits), on_switch)
+    return FallbackClient(primary, OpenAICompatClient(llm_settings(fb, overrides=False), limits, on_wait=on_wait),
+                          on_switch)

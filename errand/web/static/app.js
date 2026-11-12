@@ -140,6 +140,7 @@ function summarize(e) {
     case "limit_hit": return [`${e.limit} in ${e.state}`, "bad"];
     case "error": case "llm_error": return [short(e.error, 140), "bad"];
     case "llm_fallback": return [short(e.message, 140), "warn"];
+    case "llm_wait": return [`${e.model} · waiting ${e.seconds}s · ${e.reason}`, "warn"];
     case "assistant_msg": return [`${e.kind}: ${short(e.text, 120)}`, ""];
     case "demo": return [`${e.action} ${short(fields(e, ["action"]), 100)}`, "info"];
     default: return [short(fields(e), 140), ""];
@@ -177,7 +178,7 @@ function addEvent(e) {
 // ---------- state, memory ----------
 function setState(s) {
   $("llm").textContent = s.llm;
-  $("clock").textContent = s.now;
+  $("clock").textContent = `demo clock · ${s.now}`;
   $("errand").textContent = s.errand ? `${s.errand.kind} · ${s.errand.state}` : "no errand yet";
   $("crash").classList.toggle("armed", s.crash_next);
   $("crash").textContent = s.crash_next ? "Crash armed" : "Crash next booking";

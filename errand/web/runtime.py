@@ -58,7 +58,7 @@ def ui_message(kind: str, text: str, card: dict | None = None, role: str = "assi
     return {"role": role, "kind": kind, "text": text, **({"card": card} if card else {})}
 
 
-def make_llm(on_switch: Callable[[str], None] | None = None):
+def make_llm(on_switch: Callable[[str], None] | None = None, on_wait: Callable[[str, float, str], None] | None = None):
     """LLM_PROVIDER=scripted, or a provider whose key is missing, runs the offline policy."""
     provider = os.getenv("LLM_PROVIDER", "groq")
     if provider != "scripted":
@@ -66,7 +66,7 @@ def make_llm(on_switch: Callable[[str], None] | None = None):
             settings = llm_settings(provider)
             if settings.api_key:
                 from errand.agent.llm.openai_compat import make_client
-                return make_client(provider, on_switch=on_switch), f"{settings.provider}: {settings.model}"
+                return make_client(provider, on_switch=on_switch, on_wait=on_wait), f"{settings.provider}: {settings.model}"
         except KeyError:
             pass
     return ReactivePolicy(), "scripted (offline)"
@@ -103,7 +103,7 @@ class Runtime:
         self.clock = DemoClock()
         self.tracer = Tracer(self.traces_dir, self.clock)
         self.tracer.subscribe(TracePublisher(self.publish))
-        self.llm, self.llm_label = self.llm_factory(self._llm_fallback)
+        self.llm, self.llm_label = self.llm_factory(self._llm_fallback, self._llm_wait)
         self._boot()
         if self.seeded:
             seed_user(self.agent.store)
@@ -113,6 +113,9 @@ class Runtime:
 
     def _llm_fallback(self, message: str) -> None:
         self.tracer.emit("llm_fallback", message=message)
+
+    def _llm_wait(self, model: str, seconds: float, reason: str) -> None:
+        self.tracer.emit("llm_wait", model=model, seconds=round(seconds, 1), reason=reason)
 
     def _boot(self) -> None:
         self.mock = MockProviderService(self.data_dir / "mock.db", self.clock, preset(self.preset))
