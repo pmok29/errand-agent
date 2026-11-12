@@ -101,6 +101,8 @@ def test_rate_limit_waits_for_the_providers_reset_hint():
     assert rate_limit_wait({"retry-after": "2"}, 0) == 2.0
     assert rate_limit_wait({"x-ratelimit-reset-tokens": "1m2s"}, 0) == 15.0   # capped
     assert rate_limit_wait({}, 1) == 2.0                                     # no hint: exponential
+    # milliseconds are read, not skipped in favour of the (minutes-long) request reset
+    assert rate_limit_wait({"x-ratelimit-reset-tokens": "860ms", "x-ratelimit-reset-requests": "2m59.5s"}, 0) == 0.86
 
 
 def test_transient_failure_uses_fallback_for_that_call_only():

@@ -158,6 +158,11 @@ class MockProviderService:
         p = CATALOG.get(provider_id)
         if p is None:
             return ToolResult.fail("not_found", message=f"no provider {provider_id}")
+        mine = self.db.one("SELECT * FROM holds WHERE provider_id=? AND slot=? AND status='active' AND expires_at>?",
+                           provider_id, slot, self.clock.now().isoformat())
+        if mine is not None:  # one demo user: holding a slot you already hold returns that hold
+            return ToolResult.success(hold_id=mine["hold_id"], expires_at=mine["expires_at"],
+                                      quoted_price=mine["quoted_price"])
         day = date.fromisoformat(slot[:10])
         if slot not in self.free_slots(provider_id, day, day):
             return ToolResult.fail("slot_unavailable", message=f"{slot} is not free for {provider_id}")

@@ -10,7 +10,8 @@ from errand.agent.llm.base import LLMError, LLMResponse, ToolCall
 from errand.config import Limits, LLMSettings, llm_settings
 
 THINK = re.compile(r"<think>.*?</think>", re.S)  # qwen3 reasoning blocks
-DURATION = re.compile(r"(?:(\d+)m)?(?:([\d.]+)s)?$")
+DURATION_PART = re.compile(r"([\d.]+)(ms|h|m|s)")
+SECONDS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600}
 MAX_RATE_WAIT_S = 15.0        # per wait
 MAX_RATE_WAIT_TOTAL_S = 40.0  # per call; rate-limit waits don't use up the error retries
 PERMANENT_STATUS = {401, 403, 404}
@@ -27,8 +28,8 @@ def rate_limit_wait(headers: Any, attempt: int) -> float:
         try:
             return min(float(raw), MAX_RATE_WAIT_S)
         except ValueError:
-            if (m := DURATION.match(raw)) and (m.group(1) or m.group(2)):
-                return min(int(m.group(1) or 0) * 60 + float(m.group(2) or 0), MAX_RATE_WAIT_S)
+            if parts := DURATION_PART.findall(raw):  # Groq style: "860ms", "4.5s", "2m59.5s"
+                return min(sum(float(n) * SECONDS[u] for n, u in parts), MAX_RATE_WAIT_S)
     return float(2 ** attempt)
 
 

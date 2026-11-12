@@ -12,5 +12,8 @@ def recover(executor: Executor, tracer: Tracer) -> list[Outcome]:
     for exe in executor.store.open_executions():
         tracer.emit("recovery_resume", execution_id=exe.id, errand_id=exe.errand_id, action=exe.action,
                     state=exe.state, idem_key=exe.idem_key)
-        outcomes.append(executor.resume(exe))
+        try:
+            outcomes.append(executor.resume(exe))
+        except Exception as err:  # keep going: the others still need resuming; this one stays open
+            tracer.emit("error", where="recovery", execution_id=exe.id, error=repr(err))
     return outcomes

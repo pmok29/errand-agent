@@ -149,3 +149,56 @@ def test_single_time_bound_is_open_ended(tmp_path):
     assert e.request.time_window == ("10:00", "23:59") and e.request.date_range == ("2026-11-10", "2026-11-15")
     suresh = next(o for o in e.selected["options"] if o["provider_id"] == "p-ele-02")
     assert suresh["slots"] and all(s[11:16] >= "10:00" for s in suresh["slots"])
+
+
+def test_confirm_code_reaches_its_own_errand_when_a_rebook_shares_the_session(tmp_path):
+    """A provider cancellation mid-conversation adds a rebook errand to the session; the user's earlier
+    card must still be confirmable (codes used to be looked up only in the session's latest errand)."""
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success", "success"]), seed=True)
+    sim.tick()
+    plumber = sim.say("Plumber in Indiranagar this week, mornings, under 1500") and sim.say("option 1")[-1]
+    sim.mock.trigger_provider_cancel("b-cln-up")
+    rebook = sim.tick()[0]["messages"][-1]
+    assert sim.confirm(plumber)[0]["text"].startswith("Booked: QuickFix")
+    assert sim.confirm(rebook)[0]["text"].startswith("Booked: ShineBright")
+    assert len(sim.new_bookings()) == 2
+
+
+def test_error_after_the_booking_reports_the_booking_not_nothing(tmp_path, monkeypatch):
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]))
+    sim.say("Plumber in Indiranagar this week, mornings, under 1500")
+    card = sim.say("option 1")[-1]
+    monkeypatch.setattr(sim.agent, "_outcome", lambda e, o: 1 / 0)   # breaks after the executor finished
+    out = sim.confirm(card)
+    assert out[0]["text"].startswith("Booked:") and len(sim.new_bookings()) == 1
+
+
+@pytest.mark.parametrize("args, expected", [
+    ({"date_from": "2026-11-20"}, ("2026-11-20", "2026-11-20")),   # past the old end: that one day, no error
+    ({"date_from": "2026-11-13"}, ("2026-11-13", "2026-11-14")),   # inside: keeps the old end
+    ({"date_to": "2026-11-16"}, ("2026-11-12", "2026-11-16")),     # extends the end
+])
+def test_one_sided_date_corrections(tmp_path, args, expected):
+    from errand.agent import internal_tools
+    sim = Sim(tmp_path)
+    e = sim.agent.store.create_errand("u1", sim.sid, "book")
+    internal_tools.update_request(sim.agent.store, sim.tracer, e, {"date_from": "2026-11-12", "date_to": "2026-11-14"})
+    r = internal_tools.update_request(sim.agent.store, sim.tracer, sim.agent.store.get_errand(e.id), args)
+    assert r.ok and sim.agent.store.get_errand(e.id).request.date_range == expected
+
+
+def test_going_back_to_a_slot_you_already_hold(tmp_path):
+    """Hold A, switch to B, back to A within the hold's 10 minutes: A used to be "unavailable" (our own hold)."""
+    sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["success"]))
+    week = ["2026-11-10", "2026-11-15"]
+    a, b = next(p for p in sim.mock.search_providers("plumber", "Indiranagar", week).data["providers"]
+                if p["provider_id"] == "p-plb-01")["slots"][:2]
+    sim.agent.llm = Scripted(
+        call("update_request", service="plumber", area="Indiranagar", date_from=week[0], date_to=week[1]),
+        call("search_providers", service="plumber", area="Indiranagar", date_range=week),
+        call("hold_slot", provider_id="p-plb-01", slot=a), call("hold_slot", provider_id="p-plb-01", slot=b),
+        call("hold_slot", provider_id="p-plb-01", slot=a), call("request_approval", action="book"))
+    card = sim.say("plumber this week")[-1]
+    assert card["kind"] == "card" and card["card"]["draft"]["slot"] == a
+    assert not [c for c in sim.tool_calls("hold_slot") if not c["ok"]]
+    assert sim.confirm(card)[0]["text"].startswith("Booked:")

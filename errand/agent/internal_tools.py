@@ -17,17 +17,21 @@ MATERIAL = ("service", "area", "date_range", "time_window", "budget_max", "provi
 
 def _pair(args: dict, a: str, b: str, current: tuple | None, label: str,
           open_ends: tuple[str, str] | None = None) -> tuple | None:
-    """Merge a (from, to) pair. With only one end given: `open_ends` fills the other ("not before 10:00"
-    is 10:00 to end of day); without it, the range is that single value (one date)."""
+    """Merge a (from, to) pair. With only one end given it keeps the other current end when that still
+    makes a valid range; otherwise `open_ends` fills it ("not before 10:00" = 10:00 to end of day), or,
+    without open ends, the range is that single value ("make it the 20th" = that one day)."""
     lo, hi = args.get(a), args.get(b)
     if lo is None and hi is None:
         return current
-    if current:
-        lo, hi = lo or current[0], hi or current[1]
-    lo, hi = (lo or open_ends[0], hi or open_ends[1]) if open_ends else (lo or hi, hi or lo)
-    if hi < lo:
-        raise ValueError(f"{label}: {b} is before {a}")
-    return (lo, hi)
+    if lo is not None and hi is not None:
+        if hi < lo:
+            raise ValueError(f"{label}: {b} is before {a}")
+        return (lo, hi)
+    if current and (merged := (lo or current[0], hi or current[1]))[0] <= merged[1]:
+        return merged
+    if open_ends:
+        return (lo or open_ends[0], hi or open_ends[1])
+    return (lo or hi, lo or hi)
 
 
 def update_request(store: Store, tracer: Tracer, e: Errand, args: dict[str, Any]) -> ToolResult:

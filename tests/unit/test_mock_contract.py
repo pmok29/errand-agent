@@ -51,12 +51,20 @@ def test_get_provider_has_prompt_injection_review(tmp_path, clock):
 
 
 # ---------- hold ----------
+def first_slots(svc):
+    return next(p for p in svc.search_providers("plumber", "Indiranagar", WEEK).data["providers"]
+                if p["provider_id"] == "p-plb-01")["slots"]
+
+
 def test_hold_expires_in_10_minutes_and_blocks_slot(tmp_path, clock):
-    svc = make(tmp_path, clock)
+    svc = make(tmp_path, clock, book_outcomes=["success"])
     slot = first_slot(svc)
     res = svc.hold_slot("p-plb-01", slot)
     assert res.ok and res.data["expires_at"] == "2026-11-10T09:10:00+05:30"
-    assert svc.hold_slot("p-plb-01", slot).error.code == "slot_unavailable"
+    assert slot not in first_slots(svc)                                   # blocked: gone from search
+    assert svc.hold_slot("p-plb-01", slot).data == res.data               # re-holding your hold returns it
+    svc.book(res.data["hold_id"], "k-1")
+    assert svc.hold_slot("p-plb-01", slot).error.code == "slot_unavailable"   # booked: really taken
 
 
 def test_hold_price_drift_is_configurable(tmp_path, clock):

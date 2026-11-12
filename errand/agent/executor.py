@@ -41,23 +41,53 @@ class Executor:
         self.settings = settings or Settings()
         self.limits: Limits = self.settings.limits
         self.faults = faults if faults is not None else set()  # may be shared with the caller
+        self._sent: set[str] = set()  # executions whose side effect has been sent in this process
         self._handlers = {Action.BOOK: self._book, Action.CANCEL: self._cancel,
                           Action.RESCHEDULE: self._reschedule}
 
     # ---------- entry points ----------
     def run(self, exe: Execution) -> Outcome:
-        try:
-            return self._handlers[exe.action](exe)
-        except Exception as err:  # unexpected tool/agent error: fail closed with a clear outcome
-            self.tracer.emit("error", execution_id=exe.id, error=repr(err))
-            return self._fail(exe, f"unexpected error: {type(err).__name__}")
+        return self._guarded(exe, self._handlers[exe.action], exe)
 
     def resume(self, exe: Execution) -> Outcome:
         """Recovery after a restart: always consult the source of truth before calling again."""
-        return self._handlers[exe.action](exe, verify_first=True)
+        return self._guarded(exe, self._handlers[exe.action], exe, verify_first=True)
+
+    def _guarded(self, exe: Execution, fn: Callable[..., Outcome], *args, **kwargs) -> Outcome:
+        """Unexpected errors fail closed, but never claim "nothing changed" once the side effect was sent:
+        then the outcome is UNVERIFIED and the watcher asks the provider."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as err:
+            self.tracer.emit("error", execution_id=exe.id, error=repr(err))
+            # the errand's latest execution: a re-hold continues in a child execution
+            current = self.store.executions_for(exe.errand_id, exe.action)[-1]
+            if current.state == ExecState.DONE:  # finished before the error: report what really happened
+                o = current.result["outcome"]
+                return Outcome(o["kind"], exe.errand_id, o["data"])
+            if current.state == ExecState.FAILED:  # e.g. mid re-hold: don't leave the errand in flight
+                e = self.store.get_errand(exe.errand_id)
+                if e.state in (S.EXECUTING, S.VERIFYING):
+                    transition(self.store, self.tracer, e, S.FAILED, "error_after_failed_attempt")
+                return Outcome("failed", exe.errand_id, {"reason": current.last_error})
+            if current.state == ExecState.UNVERIFIED:
+                return Outcome("unverified", exe.errand_id, {"action": exe.action})
+            if current.id in self._sent or current.state == ExecState.VERIFYING:
+                self._move(current, ExecState.UNVERIFIED, S.UNVERIFIED, "error_after_side_effect",
+                           last_error=f"unexpected error: {type(err).__name__}")
+                return Outcome("unverified", exe.errand_id, {"action": exe.action})
+            return self._fail(current, f"unexpected error: {type(err).__name__}")
 
     def recheck_unverified(self, exe: Execution) -> Outcome | None:
-        """Watcher follow-up for an UNVERIFIED booking. None while the provider still says pending."""
+        """Watcher follow-up for an UNVERIFIED execution. None while the provider's answer is still unclear."""
+        if exe.action != Action.BOOK:
+            reflected, kind, data = self._mutation(exe)
+            row = self._booking_row(exe)
+            if row is None:
+                return None
+            if reflected(row):
+                return self._done(exe, kind, data, exe.payload["booking_id"])
+            return self._fail(exe, f"the provider shows the {exe.action} was not applied")
         s, status = self._status(exe)
         if status == "booked":
             return self._booked(exe, s.data["booking_id"])
@@ -90,6 +120,7 @@ class Executor:
         d = self.gate.check_side_effect(exe, exe.action, args)
         if not d.allow:
             return None, d.reason
+        self._sent.add(exe.id)  # from here on the provider may have acted
         return self._invoke(exe, exe.action, args), None
 
     def _move(self, exe: Execution, exec_state: ExecState, errand_state: S | None, reason: str,
@@ -140,8 +171,9 @@ class Executor:
                 if denied:
                     return self._fail(exe, f"denied: {denied}")
                 self._fault("book_returned")
-                if r is not None and not r.ok:
+                if r is not None and not r.ok and not r.error.retryable:
                     return self._book_error(exe, r)
+                # success, timeout or a transient error (503): the provider's status decides
             verify_first = False
             self._move(exe, ExecState.VERIFYING, S.VERIFYING, "verify_booking")
             out = self._verify_book(exe)
@@ -225,23 +257,26 @@ class Executor:
         row = self._booking_row(exe)
         return row is not None and reflected(row)
 
-    def _cancel(self, exe: Execution, verify_first: bool = False) -> Outcome:
+    def _mutation(self, exe: Execution) -> tuple[Callable[[dict], bool], str, dict]:
+        """For cancel/reschedule: (how the booking list shows it applied, outcome kind, outcome data)."""
         d = self._draft(exe)
-        return self._mutate_booking(exe, verify_first, lambda row: row["status"] == "cancelled",
-                                    "cancelled", {"provider_name": d.provider_name, "slot": d.slot},
-                                    exhausted_kind="cancel_failed")
+        if exe.action == Action.CANCEL:
+            return (lambda row: row["status"] == "cancelled"), "cancelled", {"provider_name": d.provider_name,
+                                                                             "slot": d.slot}
+        new_slot = exe.payload["slot"]
+        return (lambda row: row["slot"] == new_slot), "rescheduled", {"provider_name": d.provider_name,
+                                                                      "slot": new_slot, "old_slot": d.old_slot}
+
+    def _cancel(self, exe: Execution, verify_first: bool = False) -> Outcome:
+        return self._mutate_booking(exe, verify_first, exhausted_kind="cancel_failed")
 
     def _reschedule(self, exe: Execution, verify_first: bool = False) -> Outcome:
-        d, new_slot = self._draft(exe), exe.payload["slot"]
-        return self._mutate_booking(exe, verify_first, lambda row: row["slot"] == new_slot,
-                                    "rescheduled", {"provider_name": d.provider_name, "slot": new_slot,
-                                                    "old_slot": d.old_slot},
-                                    conflict_code="slot_conflict")
+        return self._mutate_booking(exe, verify_first, conflict_code="slot_conflict")
 
-    def _mutate_booking(self, exe: Execution, verify_first: bool, reflected: Callable[[dict], bool],
-                        kind: str, data: dict, conflict_code: str | None = None,
+    def _mutate_booking(self, exe: Execution, verify_first: bool, conflict_code: str | None = None,
                         exhausted_kind: str = "failed") -> Outcome:
         """Shared cancel/reschedule loop: side effect, verify via list_bookings, same-key retries."""
+        reflected, kind, data = self._mutation(exe)
         if verify_first:
             if self._applied(exe, reflected):
                 self._move(exe, ExecState.VERIFYING, S.VERIFYING, f"verify_{exe.action}")

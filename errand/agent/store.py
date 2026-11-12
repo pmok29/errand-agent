@@ -147,7 +147,7 @@ class Store:
         h = Hold(hold_id=result.data["hold_id"], errand_id=errand_id, provider_id=provider_id, slot=slot,
                  quoted_price=result.data["quoted_price"], search_price=search_price,
                  expires_at=result.data["expires_at"])
-        self.db.conn.execute("INSERT INTO holds VALUES (?,?,?,?,?,?,?)",
+        self.db.conn.execute("INSERT OR REPLACE INTO holds VALUES (?,?,?,?,?,?,?)",  # a re-hold returns the same id
                              (h.hold_id, h.errand_id, h.provider_id, h.slot, h.quoted_price,
                               h.search_price, h.expires_at))
         return h
@@ -181,6 +181,12 @@ class Store:
         row = self.db.one("SELECT * FROM approvals WHERE errand_id=? AND hash=? ORDER BY rowid DESC LIMIT 1",
                           errand_id, hash)
         return self._approval(row) if row else None
+
+    def errand_for_code(self, session_id: str, code: str) -> Errand | None:
+        """The errand in this session that issued `code` (a session can hold several, e.g. a rebook)."""
+        row = self.db.one("SELECT a.errand_id FROM approvals a JOIN errands e ON e.id = a.errand_id "
+                          "WHERE e.session_id=? AND a.code=? ORDER BY a.rowid DESC LIMIT 1", session_id, code)
+        return self.get_errand(row["errand_id"]) if row else None
 
     def approval_by_code(self, errand_id: str, code: str) -> Approval | None:
         row = self.db.one("SELECT * FROM approvals WHERE errand_id=? AND code=? ORDER BY rowid DESC LIMIT 1",

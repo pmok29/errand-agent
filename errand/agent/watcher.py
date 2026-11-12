@@ -85,21 +85,26 @@ class Watcher:
     # ---------- provider cancellations ----------
     def _provider_cancellations(self) -> list[dict[str, Any]]:
         seen = self.store.snapshots()
-        baseline = not seen  # first ever tick: record, don't alert on history
         out = []
         for user in self.store.users():
             r = self._list_bookings(user)
             if r is None:
                 continue
+            marker = f"user:{user}"           # set once we've looked at this user: their first look only records
+            baseline = marker not in seen
             for b in r.data["bookings"]:
-                prev = seen.get(b["booking_id"])
-                if prev == b["status"]:
+                if seen.get(b["booking_id"]) == b["status"]:
                     continue
+                if not baseline and b["status"] == "cancelled_by_provider":
+                    try:
+                        if note := self._handle_provider_cancel(user, b):
+                            out.append(note)
+                    except Exception as err:  # leave the snapshot alone so the next tick tries again
+                        self.tracer.emit("error", where="provider_cancel", booking_id=b["booking_id"], error=repr(err))
+                        continue
                 self.store.set_snapshot(b["booking_id"], b["status"])
-                if baseline or b["status"] != "cancelled_by_provider":
-                    continue
-                if note := self._handle_provider_cancel(user, b):
-                    out.append(note)
+            if baseline:
+                self.store.set_snapshot(marker, "seen")
         return out
 
     def _decide(self, user: str, b: dict) -> str | None:

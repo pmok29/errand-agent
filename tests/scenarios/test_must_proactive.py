@@ -32,7 +32,7 @@ def test_23_provider_cancel(tmp_path, ev):
                   expected="status rechecked at +30s; resolves to DONE; user told; still 1 book call")
 def test_28_unverified_is_rechecked(tmp_path, ev):
     sim = Sim(tmp_path, ScenarioConfig(book_outcomes=["timeout_booked"], status_pending_checks=4))
-    assert sim.book(REQUEST)[0]["text"].startswith("The provider didn't confirm in time")
+    assert sim.book(REQUEST)[0]["text"].startswith("I can't confirm yet whether the booking")
     assert sim.tick() == []                                     # schedules the first recheck
     sim.clock.advance(29)
     assert sim.tick() == []
@@ -90,3 +90,25 @@ def test_expired_approval_is_swept_and_its_code_rejected(tmp_path):
     sim.tick()
     assert sim.errand().state == S.COMPARING
     assert "expired" in sim.confirm(card)[0]["text"] and not sim.new_bookings()
+
+
+def test_a_failed_cancellation_handler_is_retried_on_the_next_tick(tmp_path, monkeypatch):
+    sim = Sim(tmp_path, seed=True)
+    sim.tick()
+    sim.mock.trigger_provider_cancel("b-cln-up")
+    monkeypatch.setattr(sim.watcher, "_handle_provider_cancel", lambda user, b: 1 / 0)
+    assert sim.tick() == [] and sim.events("error")[-1]["where"] == "provider_cancel"
+    monkeypatch.undo()
+    [note] = sim.tick()                               # the snapshot wasn't advanced, so it's picked up now
+    assert note["messages"][0]["text"].startswith("Heads up:")
+
+
+def test_a_new_users_first_booking_cancellation_is_not_swallowed(tmp_path):
+    sim = Sim(tmp_path)
+    sim.tick()                                        # baseline for u1, who has seed bookings
+    sim.agent.new_session("u2")
+    sim.tick()                                        # u2's first look: no bookings yet
+    sim.mock.conn.execute("INSERT INTO bookings VALUES ('b-u2', 'u2', 'p-cln-03', 'cleaner', '2026-11-15T10:00', "
+                          "1500, 'confirmed', NULL)")
+    sim.mock.trigger_provider_cancel("b-u2")
+    assert [n["session_id"] for n in sim.tick()] == [sim.agent.store.latest_session("u2")]

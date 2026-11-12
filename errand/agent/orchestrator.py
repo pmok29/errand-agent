@@ -69,7 +69,10 @@ class Agent:
         outcomes = recover(self.executor, self.tracer)
         for o in outcomes:
             e = self.store.get_errand(o.errand_id)
-            self.notify(e.session_id, self._outcome(e, o))
+            try:
+                self.notify(e.session_id, self._outcome(e, o))
+            except Exception as err:  # one bad notification must not stop the others
+                self.tracer.emit("error", where="recovery_notify", errand_id=e.id, error=repr(err))
         return outcomes
 
     def notify(self, session_id: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -102,6 +105,10 @@ class Agent:
             return fn(*args)
         except Exception as err:
             self.tracer.emit("error", error=repr(err))
+            e = self.store.latest_errand(session_id)
+            if e and e.state in (S.EXECUTING, S.VERIFYING, S.DONE, S.UNVERIFIED):
+                # something may have happened at the provider: report the persisted truth, never "nothing changed"
+                return [self.reply(session_id, "template", render(for_state(self.store, e)))]
             return [self.reply(session_id, "template", INTERNAL_ERROR)]
 
     # ---------- routing ----------
@@ -109,7 +116,7 @@ class Agent:
         if m := REMEMBER_RE.fullmatch(text):
             return self._answer_memory_prompt(session_id, m.group(1).lower() == "yes")
         if (code := approvals.match_code(text)) is not None:
-            e = self.store.latest_errand(session_id)
+            e = self.store.errand_for_code(session_id, code) or self.store.latest_errand(session_id)
             if e is None:
                 return [self.reply(session_id, "template", "There's nothing waiting for confirmation.")]
             return self._confirm(e, code)

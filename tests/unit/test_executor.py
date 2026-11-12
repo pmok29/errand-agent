@@ -6,7 +6,8 @@ from errand.agent import approvals
 from errand.agent.executor import SimulatedCrash
 from errand.agent.recovery import recover
 from errand.agent.state import transition
-from errand.models import Action, ErrandKind, ErrandState as S, ExecState
+from errand.agent.templates import render
+from errand.models import Action, ErrandKind, ErrandState as S, ExecState, ToolResult
 
 
 def status_before_success(w):
@@ -157,3 +158,47 @@ def test_crash_after_book_then_restart_gives_exactly_one_booking(world_factory, 
     names = [n for n, _ in w.calls]
     first_after_crash = names[names.index("book") + 1]
     assert first_after_crash == "get_booking_status"  # recovery consults the source of truth first
+
+
+# ---------- unexpected errors never claim "nothing changed" after the side effect ----------
+def test_error_after_book_was_sent_is_unverified_not_failed(world_factory, monkeypatch):
+    w = world_factory(book_outcomes=["success"])
+    e, exe = w.booked_and_approved()
+    monkeypatch.setattr(w.executor, "_verify_book", lambda exe: 1 / 0)
+    out = w.executor.run(exe)
+    assert out.kind == "unverified" and w.store.get_errand(e.id).state == S.UNVERIFIED
+    assert "booking went through" in render(out) and w.bookings_for_hold(exe.payload["hold_id"]) == 1
+    assert w.executor.recheck_unverified(w.store.get_execution(exe.id)).kind == "booked"   # the watcher resolves it
+
+
+def test_error_before_any_side_effect_fails_closed(world_factory, monkeypatch):
+    w = world_factory()
+    e, exe = w.booked_and_approved()
+    monkeypatch.setattr(w.executor, "_side_effect", lambda exe: 1 / 0)
+    assert w.executor.run(exe).kind == "failed" and w.store.get_errand(e.id).state == S.FAILED
+
+
+def test_transient_book_error_checks_status_then_retries_same_key(world_factory, monkeypatch):
+    w = world_factory(book_outcomes=["success"])
+    e, exe = w.booked_and_approved()
+    real, calls = w.mock.book, []
+
+    def flaky(hold_id, idempotency_key):
+        calls.append(idempotency_key)
+        if len(calls) == 1:
+            return ToolResult.fail("service_unavailable", retryable=True, message="503")
+        return real(hold_id, idempotency_key)
+    monkeypatch.setattr(w.mock, "book", flaky)
+    assert w.executor.run(exe).kind == "booked" and calls == [exe.idem_key] * 2
+    names = [n for n, _ in w.calls]
+    assert names.index("get_booking_status") < len(names) - 1 - names[::-1].index("book")
+
+
+def test_unverified_cancel_is_resolved_from_the_booking_list(world_factory, monkeypatch):
+    w = world_factory(cancel_fail_first=False)
+    e, exe = cancel_execution(w)
+    monkeypatch.setattr(w.executor, "_applied", lambda exe, reflected: 1 / 0)   # breaks after cancel() is sent
+    out = w.executor.run(exe)
+    assert out.kind == "unverified" and "cancellation" in render(out)
+    monkeypatch.undo()
+    assert w.executor.recheck_unverified(w.store.get_execution(exe.id)).kind == "cancelled"

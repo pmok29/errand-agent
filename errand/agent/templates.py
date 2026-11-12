@@ -39,8 +39,9 @@ def render(o: Outcome) -> str:
             return (f"The hold expired and the provider now quotes {fmt_money(d.get('new_price'))} "
                     f"instead of {fmt_money(d.get('old_price'))}. Nothing was booked; please confirm the new price.")
         case "unverified":
-            return ("The provider didn't confirm in time, so I can't tell yet whether the booking went through. "
-                    "I have not made a second booking, and I'll check again and let you know.")
+            what = {"cancel": "cancellation", "reschedule": "change"}.get(d.get("action"), "booking")
+            return (f"I can't confirm yet whether the {what} went through on the provider's side. "
+                    f"I haven't repeated it, and I'll check again and let you know.")
         case "failed":
             return f"That didn't go through ({d.get('reason', 'unexpected error')}). Nothing was changed on your side."
         case "cancel_failed":
