@@ -18,8 +18,10 @@ MAX_RATE_WAIT_TOTAL_S = 150.0  # per call; rate-limit waits don't use up the err
                                # 180 s limit still bounds it (free tier: 7-8k tokens/min, ~3k per call)
 GIVE_UP_HINT_S = 40.0          # a longer "try again in …" is a daily limit: let the fallback answer now
 PERMANENT_STATUS = {401, 403, 404}
-# Groq validates tool arguments server-side and rejects the whole response with a 400.
-TOOL_VALIDATION = re.compile(r"tool call validation failed|tool_use_failed", re.I)
+# Groq parses and validates the model's output server-side and rejects the whole response with a 400 when it
+# can't (bad tool arguments, or output it can't parse at all). The model's mistake, so worth one more try.
+MODEL_OUTPUT_ERROR = re.compile(r"tool call validation failed|tool_use_failed|parsing failed|output_parse_failed|"
+                                r"failed_generation", re.I)
 
 
 def rate_limit_hint(headers: Any, message: str = "") -> float | None:
@@ -97,7 +99,7 @@ class OpenAICompatClient:
                 wait = max(rate_limit_wait(e.response.headers, waits), 1.0)
                 # a daily limit says "try again in 9m": don't sit out the budget, let the fallback answer now
                 if waited + wait > MAX_RATE_WAIT_TOTAL_S or (hint or 0) > GIVE_UP_HINT_S:
-                    raise LLMError(f"{type(e).__name__}: {e}", retryable=True) from e
+                    raise LLMError(f"{type(e).__name__}: {e}", retryable=True, retry_after=hint) from e
                 waited, waits = waited + wait, waits + 1
                 wait_or_give_up(wait)
                 continue
@@ -108,12 +110,12 @@ class OpenAICompatClient:
                 failures += 1
                 continue
             except openai.APIStatusError as e:  # 4xx other than 429: auth, bad request, unknown model
-                if e.status_code == 400 and TOOL_VALIDATION.search(str(e)) and not corrected:
+                if e.status_code == 400 and MODEL_OUTPUT_ERROR.search(str(e)) and not corrected:
                     # the model's mistake, not the provider's: tell it what was wrong and let it try once more
                     corrected = True
                     kwargs["messages"] = [*messages, {"role": "system", "content": (
-                        f"Your previous tool call was rejected: {e.message}. Call the tool again with valid "
-                        "arguments, using the exact enum values from its schema.")}]
+                        f"Your previous reply was rejected: {e.message}. Reply again with either plain text or "
+                        "tool calls whose arguments are valid JSON using the exact enum values from the schema.")}]
                     continue
                 raise LLMError(f"{type(e).__name__} {e.status_code}: {e}", retryable=False,
                                permanent=e.status_code in PERMANENT_STATUS) from e
@@ -123,11 +125,14 @@ class OpenAICompatClient:
 
 class FallbackClient:
     """Primary provider first. A transient failure (rate limit, outage) uses the fallback for that call
-    only; a permanent one (bad key, unknown model) switches to the fallback for good."""
+    only; a daily limit ("try again in 11m") skips the primary until then; a permanent one (bad key,
+    unknown model) switches to the fallback for good."""
 
-    def __init__(self, primary: Any, fallback: Any, on_switch: Callable[[str], None] | None = None):
-        self.primary, self.fallback, self.on_switch = primary, fallback, on_switch
+    def __init__(self, primary: Any, fallback: Any, on_switch: Callable[[str], None] | None = None,
+                 now: Callable[[], float] = time.monotonic):
+        self.primary, self.fallback, self.on_switch, self.now = primary, fallback, on_switch, now
         self.active = primary
+        self.primary_back_at = 0.0
 
     @property
     def model(self) -> str:
@@ -135,6 +140,8 @@ class FallbackClient:
 
     def complete(self, messages, tools, time_left_s: float | None = None) -> LLMResponse:
         stop = None if time_left_s is None else time.monotonic() + time_left_s
+        if self.active is self.primary and self.now() < self.primary_back_at:
+            return self.fallback.complete(messages, tools, time_left_s)   # the primary said when to come back
         try:
             return self.active.complete(messages, tools, time_left_s)
         except LLMError as e:
@@ -142,8 +149,12 @@ class FallbackClient:
                 raise
             if e.permanent:
                 self.active = self.fallback
+            elif e.retry_after and e.retry_after > GIVE_UP_HINT_S:
+                self.primary_back_at = self.now() + e.retry_after
             if self.on_switch:
-                scope = "switched" if self.active is self.fallback else "this call only"
+                scope = ("switched" if self.active is self.fallback else
+                         f"for the next {e.retry_after / 60:.0f} min" if self.primary_back_at > self.now()
+                         else "this call only")
                 self.on_switch(f"{self.primary.model} failed ({e}); using {self.fallback.model} ({scope})")
             try:
                 return self.fallback.complete(messages, tools, None if stop is None else stop - time.monotonic())

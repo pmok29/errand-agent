@@ -238,3 +238,21 @@ model (bug #7). They carry no information for the model, and a model under press
 (`errand/agent/orchestrator.py`, `errand/agent/context.py`)
 
 **Regression test.** `tests/unit/test_orchestrator.py::test_outage_notice_never_reaches_the_model_or_comes_back_labelled`.
+
+## 14. The fallback model's unparseable output ended the turn as an outage
+
+**What broke.** Web demo with gpt-oss-120b at its daily cap: the fallback (gpt-oss-20b) took over, then
+Groq rejected its reply with a 400 *"Parsing failed. The model generated output that could not be
+parsed"*, and the user got "I'm having trouble reaching my language model". Replaying the same context
+against gpt-oss-20b succeeded twice: the failure is intermittent.
+
+**Why.** The client gave one corrective retry only for Groq's tool-validation 400s; any other 400 was
+treated as fatal. Separately, every call tried the capped primary first, so each step paid a 429 and
+logged a fallback.
+
+**Fix.** Parse-failure 400s get the same single corrective retry. A daily limit ("try again in 11m")
+now skips the primary until then, logged once as `llm_fallback … for the next 12 min`.
+(`errand/agent/llm/openai_compat.py`)
+
+**Regression tests.** `tests/unit/test_llm_clients.py::test_unparseable_model_output_is_retried_once` and
+`::test_daily_limit_skips_the_primary_until_it_resets`.

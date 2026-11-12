@@ -26,9 +26,10 @@ class LLMResponse:
 class LLMError(Exception):
     """retryable: transient (rate limit, outage). permanent: this provider can't work (bad key, unknown model)."""
 
-    def __init__(self, message: str, retryable: bool = False, permanent: bool = False):
+    def __init__(self, message: str, retryable: bool = False, permanent: bool = False,
+                 retry_after: float | None = None):
         super().__init__(message)
-        self.retryable, self.permanent = retryable, permanent
+        self.retryable, self.permanent, self.retry_after = retryable, permanent, retry_after
 
 
 class LLMDeadline(LLMError):

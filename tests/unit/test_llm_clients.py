@@ -139,7 +139,7 @@ def test_server_side_tool_validation_error_is_fed_back_once():
     c, sdk = client(bad, message(None, [("search_providers", '{"service": "electrician"}')]))
     r = c.complete([{"role": "user", "content": "hi"}], [{"type": "function"}])
     assert r.tool_calls[0].args == {"service": "electrician"}
-    assert "previous tool call was rejected" in sdk.calls[1]["messages"][-1]["content"]
+    assert "previous reply was rejected" in sdk.calls[1]["messages"][-1]["content"]
 
 
 def test_only_auth_or_unknown_model_switch_the_fallback_for_good():
@@ -187,3 +187,30 @@ def test_per_minute_limits_are_waited_out_beyond_40_seconds():
     slept = []
     c, _ = client(rate, rate, rate, rate, message("ok"), slept=slept)
     assert c.complete([], []).text == "ok" and sum(slept) == 60
+
+
+def test_unparseable_model_output_is_retried_once():
+    """Demo run: the fallback gpt-oss-20b got a Groq 400 "Parsing failed" and the turn ended as an outage;
+    replaying the same context succeeded, so one corrective retry is enough."""
+    bad = openai.BadRequestError("Error code: 400 - Parsing failed. The model generated output that could not be "
+                                 "parsed. See 'failed_generation' for more details.",
+                                 response=httpx.Response(400, request=REQ), body=None)
+    c, sdk = client(bad, message("Here are three options."))
+    assert c.complete([{"role": "user", "content": "plumber"}], []).text == "Here are three options."
+    assert len(sdk.calls) == 2 and "previous reply was rejected" in sdk.calls[1]["messages"][-1]["content"]
+    c, _ = client(bad, bad)
+    with pytest.raises(LLMError):                          # only once: a second failure is reported
+        c.complete([], [])
+
+
+def test_daily_limit_skips_the_primary_until_it_resets():
+    msg = "Rate limit reached ... on tokens per day (TPD). Please try again in 11m48.48s."
+    daily = openai.RateLimitError(msg, response=httpx.Response(429, request=REQ), body=None)
+    primary, psdk = client(daily, message("primary is back"))
+    secondary, _ = client(message("fb 1"), message("fb 2"))
+    clock, notes = [1000.0], []
+    fb = FallbackClient(primary, secondary, on_switch=notes.append, now=lambda: clock[0])
+    assert fb.complete([], []).text == "fb 1" and fb.complete([], []).text == "fb 2"
+    assert len(psdk.calls) == 1 and len(notes) == 1 and "next 12 min" in notes[0]   # one switch, traced once
+    clock[0] += 709
+    assert fb.complete([], []).text == "primary is back"
